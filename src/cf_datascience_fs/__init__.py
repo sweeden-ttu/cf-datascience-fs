@@ -15,7 +15,6 @@ Server side (the machine that has the drive)::
 """
 
 from ._version import __version__
-from .core import DEFAULT_PORT, CFDataScienceFile, CFDataScienceFileSystem, FileChangedError
 
 __all__ = [
     "DEFAULT_PORT",
@@ -24,3 +23,19 @@ __all__ = [
     "FileChangedError",
     "__version__",
 ]
+
+_CLIENT_NAMES = frozenset(__all__) - {"__version__"}
+
+
+def __getattr__(name):
+    # The client is imported on first use, so that ``cf_datascience_fs.server`` (which
+    # needs only the standard library) can run on a machine without fsspec or requests.
+    if name in _CLIENT_NAMES:
+        from . import core
+
+        return getattr(core, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(__all__)

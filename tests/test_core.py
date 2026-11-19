@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import fsspec
 import pytest
-from conftest import start_server, stop_server
+from conftest import bump_mtime, can_symlink, start_server, stop_server
 from fsspec.callbacks import Callback
 
 from cf_datascience_fs import CFDataScienceFile, CFDataScienceFileSystem, FileChangedError
@@ -270,6 +270,7 @@ def test_file_changed_while_open_raises(fs, drive, big_bytes):
     with fs.open("/datasets/big.bin", "rb", block_size=64 * 1024) as handle:
         assert handle.read(10) == big_bytes[:10]
         (drive / "datasets" / "big.bin").write_bytes(b"x" * len(big_bytes))
+        bump_mtime(drive / "datasets" / "big.bin")
         handle.seek(2_000_000)
         with pytest.raises(FileChangedError):
             handle.read(10)
@@ -400,6 +401,12 @@ def test_server_unreachable_raises_connection_error(server):
         fresh.ls("/")
     with pytest.raises(ConnectionError):
         fresh.cat_file("/hello.txt")
+    # "Cannot reach the server" must never be reported as "the file is not there".
+    for probe in (fresh.exists, fresh.isfile, fresh.isdir, fresh.find, fresh.du):
+        with pytest.raises(ConnectionError):
+            probe("/hello.txt")
+    with pytest.raises(ConnectionError):
+        fresh.glob("/datasets/*.csv")
 
 
 def test_token_auth(drive, monkeypatch):
@@ -414,6 +421,14 @@ def test_token_auth(drive, monkeypatch):
         wrong = CFDataScienceFileSystem(**common, token="nope", skip_instance_cache=True)
         with pytest.raises(PermissionError):
             wrong.info("/hello.txt")
+        for probe in (wrong.exists, wrong.isfile, wrong.isdir, wrong.find, wrong.du):
+            with pytest.raises(PermissionError):
+                probe("/")
+        with pytest.raises(PermissionError):
+            wrong.glob("/datasets/*.csv")
+        with pytest.raises(PermissionError):
+            list(wrong.walk("/"))
+        assert list(wrong.walk("/", on_error="omit")) == []
         right = CFDataScienceFileSystem(**common, token="s3cret-token", skip_instance_cache=True)
         assert right.cat_file("/hello.txt") == b"hello world\n"
 
@@ -549,3 +564,403 @@ def test_pyarrow_dataset_over_fsspec(fs, drive):
     dataset = ds.dataset("/tables", filesystem=fs, format="parquet")
     assert dataset.count_rows() == 30
     assert sorted(set(dataset.to_table()["part"].to_pylist())) == [0, 1, 2]
+
+
+# -- regression tests from review ----------------------------------------------------
+
+
+def test_env_token_is_read_at_request_time(drive, monkeypatch):
+    """Setting $CFDS_TOKEN after a first failed attempt must work without a restart."""
+    server, thread = start_server(drive, token="s3cret-token")
+    try:
+        url = f"cfds://127.0.0.1:{server.port}/hello.txt"
+        with pytest.raises(PermissionError):
+            fsspec.open(url, "rb", retries=0).open()
+        monkeypatch.setenv("CFDS_TOKEN", "s3cret-token")
+        with fsspec.open(url, "rb", retries=0) as handle:  # same cached instance as above
+            assert handle.read() == b"hello world\n"
+        monkeypatch.setenv("CFDS_TOKEN", "rotated-away")
+        with pytest.raises(PermissionError):
+            fsspec.open(url, "rb", retries=0).open()
+    finally:
+        stop_server(server, thread)
+
+
+def test_invalid_token_is_rejected_up_front():
+    for bad in ("pässwörd", "two words", ""):
+        with pytest.raises(ValueError):
+            CFDataScienceFileSystem(host="h", token=bad, skip_instance_cache=True)
+
+
+def test_netrc_does_not_replace_the_token(drive, tmp_path, monkeypatch):
+    netrc = tmp_path / "netrc"
+    netrc.write_text("default login someone password hunter2\n")
+    monkeypatch.setenv("NETRC", str(netrc))
+    seen = []
+    server, thread = start_server(drive, token="s3cret-token")
+    original = server.RequestHandlerClass._authorized
+
+    def spy(handler):
+        seen.append(handler.headers.get("Authorization"))
+        return original(handler)
+
+    monkeypatch.setattr(server.RequestHandlerClass, "_authorized", spy)
+    try:
+        common = {"host": "127.0.0.1", "port": server.port, "retries": 0}
+        with_token = CFDataScienceFileSystem(
+            **common, token="s3cret-token", skip_instance_cache=True
+        )
+        assert with_token.cat_file("/hello.txt") == b"hello world\n"
+        without = CFDataScienceFileSystem(**common, skip_instance_cache=True)
+        with pytest.raises(PermissionError):
+            without.cat_file("/hello.txt")
+        assert seen == ["Bearer s3cret-token", None]  # the netrc password never left
+    finally:
+        stop_server(server, thread)
+
+
+def test_filesystem_block_size_is_used_by_open(server):
+    common = {"host": "127.0.0.1", "port": server.port, "retries": 0, "skip_instance_cache": True}
+    tuned = CFDataScienceFileSystem(block_size=4096, **common)
+    with tuned.open("/datasets/big.bin") as handle:
+        assert handle.blocksize == 4096
+    with tuned.open("/datasets/big.bin", block_size=8192) as handle:
+        assert handle.blocksize == 8192
+    default = CFDataScienceFileSystem(**common)
+    with default.open("/datasets/big.bin") as handle:
+        assert handle.blocksize == 5 * 2**20
+    with fsspec.open(
+        f"cfds://127.0.0.1:{server.port}/datasets/big.bin", "rb", block_size=2048, retries=0
+    ) as handle:
+        assert handle.blocksize == 2048
+
+
+def test_open_file_can_be_pickled(fs, big_bytes):
+    with fs.open("/datasets/big.bin", "rb") as handle:
+        handle.seek(1000)
+        clone = pickle.loads(pickle.dumps(handle))
+        try:
+            assert clone.tell() == 1000
+            assert clone.read(50) == big_bytes[1000:1050]
+        finally:
+            clone.close()
+
+
+def test_open_accepts_size_keyword(fs):
+    with fs.open("/hello.txt", "rb", size=12) as handle:
+        assert handle.read() == b"hello world\n"
+    # A wrong size from the caller does not override what the server reports.
+    with fs.open("/hello.txt", "rb", size=3) as handle:
+        assert handle.read() == b"hello world\n"
+
+
+def test_blockcache_chaining(server, tmp_path, big_bytes):
+    url = f"blockcache::cfds://127.0.0.1:{server.port}/datasets/big.bin"
+    options = {
+        "blockcache": {"cache_storage": str(tmp_path / "blocks")},
+        "cfds": {"retries": 0},
+    }
+    with fsspec.open(url, "rb", **options) as handle:
+        handle.seek(3_000_000)
+        assert handle.read(100) == big_bytes[3_000_000:3_000_100]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
+def test_open_refuses_special_files(fs, drive):
+    os.mkfifo(drive / "pipe")
+    assert fs.info("/pipe")["type"] == "other"
+    with pytest.raises(PermissionError):
+        fs.open("/pipe", "rb")
+    with pytest.raises(PermissionError):
+        fs.cat_file("/pipe")
+
+
+def test_symlink_cycle_does_not_recurse_forever(fs, drive, tmp_path):
+    if not can_symlink(tmp_path):
+        pytest.skip("symlinks are not available")
+    os.symlink(drive, drive / "datasets" / "loop")  # points back up the tree
+    os.symlink(drive / "datasets" / "nested", drive / "shortcut")
+
+    listed = {entry["name"]: entry for entry in fs.ls("/datasets")}
+    assert listed["/datasets/loop"]["type"] == "directory"
+    assert listed["/datasets/loop"]["islink"] is True
+
+    expected = [
+        "/datasets/big.bin",
+        "/datasets/nested/deep.txt",
+        "/datasets/train.csv",
+        "/empty.bin",
+        "/hello.txt",
+    ]
+    assert fs.find("/") == expected
+    assert fs.glob("/**/*.txt") == ["/datasets/nested/deep.txt", "/hello.txt"]
+    assert fs.du("/") > 0
+    for topdown in (True, False):
+        walked = {root: sorted(dirs) for root, dirs, _ in fs.walk("/", topdown=topdown)}
+        assert sorted(walked) == ["/", "/datasets", "/datasets/nested", "/empty_dir"]
+        assert walked["/"] == ["datasets", "empty_dir", "shortcut"]  # reported, not entered
+        assert walked["/datasets"] == ["loop", "nested"]
+    # A linked directory can still be used when it is named explicitly.
+    assert fs.ls("/shortcut", detail=False) == ["/shortcut/deep.txt"]
+    assert fs.find("/shortcut") == ["/shortcut/deep.txt"]
+    assert fs.cat_file("/datasets/loop/hello.txt") == b"hello world\n"
+
+
+def test_walk_maxdepth_and_pruning(fs):
+    assert [root for root, _, _ in fs.walk("/", maxdepth=1)] == ["/"]
+    assert sorted(root for root, _, _ in fs.walk("/", maxdepth=2)) == [
+        "/",
+        "/datasets",
+        "/empty_dir",
+    ]
+    with pytest.raises(ValueError):
+        list(fs.walk("/", maxdepth=0))
+    visited = []
+    for root, dirs, _ in fs.walk("/"):
+        visited.append(root)
+        if "datasets" in dirs:
+            dirs.remove("datasets")  # pruning in place, as with os.walk
+    assert visited == ["/", "/empty_dir"]
+    detailed = dict((root, (dirs, files)) for root, dirs, files in fs.walk("/", detail=True))
+    assert detailed["/"][1]["hello.txt"]["size"] == 12
+    assert detailed["/"][0]["datasets"]["type"] == "directory"
+    assert list(fs.walk("/missing")) == []
+
+
+def make_sparse(path, size):
+    with open(path, "wb") as handle:
+        handle.truncate(size)
+
+
+HUGE = 256 * 1024 * 1024  # far more than socket buffers hold, so a change lands mid-transfer
+
+
+class _ModifyOnFirstChunk(Callback):
+    """Rewrites the remote file as soon as the first bytes of it have arrived."""
+
+    def __init__(self, target, action):
+        super().__init__()
+        self.target, self.action, self.done = target, action, False
+
+    def relative_update(self, inc=1):
+        if not self.done:
+            self.done = True
+            self.action(self.target)
+        super().relative_update(inc)
+
+
+def rewrite_in_place(target):
+    with open(target, "r+b") as handle:
+        handle.write(b"changed")
+    bump_mtime(target)
+
+
+@pytest.mark.parametrize("action", [rewrite_in_place, lambda target: os.truncate(target, 10)])
+def test_get_file_detects_change_and_keeps_the_old_local_copy(fs, drive, tmp_path, action):
+    make_sparse(drive / "huge.bin", HUGE)
+    local = tmp_path / "downloads" / "huge.bin"
+    local.parent.mkdir()
+    local.write_bytes(b"previous good copy")
+    with pytest.raises(FileChangedError):
+        fs.get_file(
+            "/huge.bin", str(local), callback=_ModifyOnFirstChunk(drive / "huge.bin", action)
+        )
+    assert local.read_bytes() == b"previous good copy"
+    assert os.listdir(local.parent) == ["huge.bin"]  # no partial file left behind
+
+
+def test_get_file_failure_leaves_no_new_file(fs, drive, tmp_path):
+    make_sparse(drive / "huge.bin", HUGE)
+    local = tmp_path / "downloads" / "huge.bin"
+    with pytest.raises(FileChangedError):
+        fs.get_file(
+            "/huge.bin",
+            str(local),
+            callback=_ModifyOnFirstChunk(drive / "huge.bin", rewrite_in_place),
+        )
+    assert os.listdir(local.parent) == []
+
+
+def test_removed_file_during_download_is_reported_as_changed(fs, drive, tmp_path):
+    make_sparse(drive / "huge.bin", HUGE)
+
+    def replace(target):
+        os.truncate(target, 0)
+        os.unlink(target)
+
+    with pytest.raises(FileChangedError):
+        fs.get_file(
+            "/huge.bin",
+            str(tmp_path / "out.bin"),
+            callback=_ModifyOnFirstChunk(drive / "huge.bin", replace),
+        )
+    assert not (tmp_path / "out.bin").exists()
+
+
+class _RewriteAfterFirstRead:
+    """Wraps the server's open file and rewrites it on disk right after the first read."""
+
+    def __init__(self, raw, target, state):
+        self._raw, self._target, self._state = raw, target, state
+
+    def read(self, size=-1):
+        data = self._raw.read(size)
+        if not self._state["done"]:
+            self._state["done"] = True
+            rewrite_in_place(self._target)
+        return data
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self._raw.close()
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        lambda fs, path: fs.cat_file(path),
+        lambda fs, path: fs.cat_file(path, start=0, end=3 * 2**20),
+        lambda fs, path: fs.open(path, "rb").read(),
+    ],
+    ids=["cat_file", "cat_file_range", "open_read"],
+)
+def test_single_request_reads_detect_change(fs, drive, monkeypatch, read):
+    """cat_file and open().read() fetch in one request; a rewrite mid-way must not go unnoticed."""
+    from cf_datascience_fs import server as server_module
+
+    target = drive / "datasets" / "mid.bin"
+    target.write_bytes(b"a" * (4 * server_module.CHUNK_SIZE))
+    state = {"done": False}
+    real_open = server_module.open_regular_file
+
+    def open_regular_file(root, path):
+        handle, st = real_open(root, path)
+        return _RewriteAfterFirstRead(handle, target, state), st
+
+    monkeypatch.setattr(server_module, "open_regular_file", open_regular_file)
+    with pytest.raises(FileChangedError):
+        read(fs, "/datasets/mid.bin")
+    assert state["done"]
+
+
+def test_interrupted_transfer_of_unchanged_file_is_not_called_a_change(fs, drive, monkeypatch):
+    """When the bytes stop but the file is unchanged, say so instead of blaming a change."""
+    from cf_datascience_fs import server as server_module
+
+    target = drive / "datasets" / "mid.bin"
+    target.write_bytes(b"a" * (4 * server_module.CHUNK_SIZE))
+    real_open = server_module.open_regular_file
+
+    class Truncating:
+        def __init__(self, raw):
+            self._raw, self._reads = raw, 0
+
+        def read(self, size=-1):
+            self._reads += 1
+            return self._raw.read(size) if self._reads == 1 else b""  # pretend EOF
+
+        def __getattr__(self, name):
+            return getattr(self._raw, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            self._raw.close()
+
+    monkeypatch.setattr(
+        server_module,
+        "open_regular_file",
+        lambda root, path: (lambda h, st: (Truncating(h), st))(*real_open(root, path)),
+    )
+    with pytest.raises(OSError, match="interrupted") as excinfo:
+        fs.cat_file("/datasets/mid.bin")
+    assert not isinstance(excinfo.value, FileChangedError)
+
+
+def test_simplecache_does_not_keep_a_partial_download(server, drive, tmp_path):
+    make_sparse(drive / "huge.bin", HUGE)
+    fs = CFDataScienceFileSystem(
+        host="127.0.0.1", port=server.port, retries=0, skip_instance_cache=True
+    )
+    original = fs.get_file
+
+    def get_file(rpath, lpath, **kwargs):
+        kwargs["callback"] = _ModifyOnFirstChunk(drive / "huge.bin", rewrite_in_place)
+        return original(rpath, lpath, **kwargs)
+
+    fs.get_file = get_file
+    cached = fsspec.filesystem(
+        "simplecache", fs=fs, cache_storage=str(tmp_path / "cache"), skip_instance_cache=True
+    )
+    with pytest.raises(FileChangedError):
+        cached.open("/huge.bin", "rb")
+    assert [name for name in os.listdir(tmp_path / "cache") if not name.endswith(".part")] == []
+    assert os.listdir(tmp_path / "cache") == []
+
+
+def test_invalidate_cache_covers_the_subtree(server, drive):
+    fs = CFDataScienceFileSystem(
+        host="127.0.0.1", port=server.port, retries=0, use_listings_cache=True,
+        skip_instance_cache=True,
+    )  # fmt: skip
+    for path in ("/", "/datasets", "/datasets/nested"):
+        fs.ls(path)
+    (drive / "datasets" / "nested" / "new.txt").write_text("new")
+    assert "/datasets/nested/new.txt" not in fs.ls("/datasets/nested", detail=False)
+    fs.invalidate_cache("/datasets")
+    assert "/datasets/nested/new.txt" in fs.ls("/datasets/nested", detail=False)
+    assert "/datasets/nested/new.txt" in fs.find("/datasets")
+
+
+def test_failed_refresh_evicts_the_stale_listing(server, drive):
+    fs = CFDataScienceFileSystem(
+        host="127.0.0.1", port=server.port, retries=0, use_listings_cache=True,
+        skip_instance_cache=True,
+    )  # fmt: skip
+    assert fs.ls("/empty_dir") == []
+    os.rmdir(drive / "empty_dir")
+    assert fs.ls("/empty_dir") == []  # still cached
+    with pytest.raises(FileNotFoundError):
+        fs.ls("/empty_dir", refresh=True)
+    with pytest.raises(FileNotFoundError):
+        fs.ls("/empty_dir")
+
+
+def test_timeout_pair_survives_json_round_trip(server):
+    fs = CFDataScienceFileSystem(
+        host="127.0.0.1", port=server.port, retries=0, timeout=(3, 30), skip_instance_cache=True
+    )
+    clone = CFDataScienceFileSystem.from_json(fs.to_json())
+    assert clone.timeout == (3, 30)
+    assert clone.cat_file("/hello.txt") == b"hello world\n"
+
+
+def test_host_not_allowed_is_a_permission_error(drive):
+    """A dotted DNS name the server was not told about is refused with a useful message."""
+    server, thread = start_server(drive)
+    try:
+        fs = CFDataScienceFileSystem(
+            host="127.0.0.1", port=server.port, retries=0, skip_instance_cache=True
+        )
+        fs.session.headers["Host"] = "drive.corp.example"
+        with pytest.raises(PermissionError, match="--allowed-host"):
+            fs.ls("/")
+    finally:
+        stop_server(server, thread)
+
+
+def test_package_exports_are_lazy_but_complete():
+    import cf_datascience_fs
+
+    assert cf_datascience_fs.CFDataScienceFileSystem is CFDataScienceFileSystem
+    assert cf_datascience_fs.FileChangedError is FileChangedError
+    assert cf_datascience_fs.DEFAULT_PORT == 8765
+    assert set(cf_datascience_fs.__all__) <= set(dir(cf_datascience_fs))
+    with pytest.raises(AttributeError):
+        cf_datascience_fs.does_not_exist  # noqa: B018

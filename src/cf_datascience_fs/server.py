@@ -1,15 +1,17 @@
 """Read-only HTTP server that exposes one directory tree to :mod:`cf_datascience_fs.core`.
 
-It uses only the standard library, so the machine that holds the drive needs nothing
-beyond Python. There are two endpoints, both ``GET`` (and ``HEAD``) only:
+This module imports only the standard library. There are two endpoints, both ``GET``
+(and ``HEAD``) only:
 
 ``/v1/ls?path=<path>[&list=0]``
     JSON description of ``path``: ``{"info": {...}, "entries": [...] | null}``.
     ``entries`` is the directory listing, or ``null`` for a file or when ``list=0``.
 
 ``/v1/file?path=<path>``
-    The file's bytes. Honours a single ``Range: bytes=...`` header (``206``) and an
-    ``If-Match: <etag>`` precondition (``412`` when the file changed).
+    The file's bytes. Honours a single ``Range: bytes=...`` header (``206``), an
+    ``If-Match: <etag>`` precondition (``412`` when the file changed) and ``If-Range``.
+    If the file changes while it is being sent, the connection is cut short so the
+    client sees an incomplete transfer instead of a mix of old and new bytes.
 
 Paths are POSIX style and relative to the served root. Every path is resolved with
 symlinks followed and must stay inside the root; anything else is refused.
@@ -20,6 +22,7 @@ from __future__ import annotations
 import argparse
 import errno
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -27,7 +30,9 @@ import re
 import socket
 import ssl
 import stat as stat_module
+import string
 import sys
+import threading
 from email.utils import formatdate
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -44,6 +49,11 @@ DEFAULT_PORT = 8765
 CHUNK_SIZE = 1024 * 1024
 #: Seconds a connection may sit idle (or stall mid-transfer) before it is dropped.
 SOCKET_TIMEOUT = 120
+#: Connections served at once. Each one costs a thread and up to two descriptors.
+DEFAULT_MAX_CONNECTIONS = 256
+#: How much of an unwanted request body is read and thrown away before closing.
+MAX_DRAIN = 1024 * 1024
+_TOKEN_CHARS = frozenset(string.ascii_letters + string.digits + "-._~+/=")
 
 _RANGE_RE = re.compile(r"\s*bytes\s*=\s*(\d{0,18})\s*-\s*(\d{0,18})\s*", re.ASCII)
 _NOT_FOUND_ERRNOS = {errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.ENAMETOOLONG}
@@ -140,7 +150,22 @@ def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
 
 
 def make_etag(st: os.stat_result) -> str:
-    return f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
+    """Validator built from mtime, size and inode.
+
+    It changes when a file is rewritten or replaced, as far as the file system's
+    timestamp resolution can tell: a same-size rewrite within one timestamp tick of
+    the previous write is not distinguishable.
+    """
+    return f'"{st.st_mtime_ns:x}-{st.st_size:x}-{st.st_ino:x}"'
+
+
+def validate_token(token: str) -> str:
+    """Bearer tokens must be plain ASCII (RFC 6750) so every HTTP client sends the same bytes."""
+    if not token or not set(token) <= _TOKEN_CHARS:
+        raise ValueError(
+            "the token must be non-empty and use only letters, digits and -._~+/= characters"
+        )
+    return token
 
 
 def _etag_matches(header: str, etag: str) -> bool:
@@ -161,11 +186,61 @@ def _entry(name: str, st: os.stat_result, islink: bool) -> dict:
     return entry
 
 
+_DIR_FD_OPEN = os.open in getattr(os, "supports_dir_fd", ())
+
+
+def _open_confined(real_root: str, real: str, normalized: str, flags: int) -> int:
+    """Open the already-resolved path ``real`` without following any symlink.
+
+    ``resolve_path`` checks a path *string*, and ``real`` contained no symlinks when it
+    was computed. Someone with write access to the tree could still swap a directory for
+    a symlink before the open. So the path is walked from the root one component at a
+    time, relative to the previous directory's descriptor, with ``O_NOFOLLOW``: a
+    component that has become a symlink makes the open fail instead of leading outside.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    if not _DIR_FD_OPEN:  # e.g. Windows: no descriptor-relative open available
+        return os.open(real, flags | nofollow)
+    parts = [] if real == real_root else os.path.relpath(real, real_root).split(os.sep)
+    directory = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    fd = os.open(real_root, directory if parts else flags | nofollow)
+    try:
+        for index, part in enumerate(parts):
+            last = index == len(parts) - 1
+            child = os.open(part, flags | nofollow if last else directory, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        if stat_module.S_ISLNK(os.fstat(fd).st_mode):
+            # Only reachable with O_PATH, which opens a symlink itself rather than failing.
+            raise HTTPError(
+                HTTPStatus.FORBIDDEN, "forbidden", f"path is outside the root: {normalized}"
+            )
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+_HAS_O_PATH = hasattr(os, "O_PATH")
+_SCANDIR_FD = os.scandir in getattr(os, "supports_fd", ())
+
+
+def _stat_confined(real_root: str, real: str, normalized: str) -> os.stat_result:
+    """``os.stat`` that cannot be tricked into describing something outside the root."""
+    if not _HAS_O_PATH:
+        return os.stat(real)  # no descriptor-based check available on this platform
+    fd = _open_confined(real_root, real, normalized, os.O_PATH)
+    try:
+        return os.fstat(fd)
+    finally:
+        os.close(fd)
+
+
 def describe(real_root: str, client_path: str, list_entries: bool = True) -> dict:
     """Build the ``/v1/ls`` response body for ``client_path``."""
     normalized, real = resolve_path(real_root, client_path)
     try:
-        st = os.stat(real)
+        st = _stat_confined(real_root, real, normalized)
         islink = normalized != "/" and os.path.islink(
             os.path.join(real_root, *normalized.strip("/").split("/"))
         )
@@ -181,33 +256,32 @@ def describe(real_root: str, client_path: str, list_entries: bool = True) -> dic
 def _list_directory(real_root: str, normalized: str, real: str) -> list[dict]:
     prefix = normalized.rstrip("/") + "/"
     entries = []
-    with os.scandir(real) as iterator:
-        for item in iterator:
-            try:
-                islink = item.is_symlink()
-                if islink:
-                    # Links that are broken or point outside the root are not served,
-                    # so they are left out of listings as well.
-                    target = os.path.realpath(item.path)
-                    if not is_within(target, real_root):
-                        continue
-                    st = os.stat(target)
-                else:
-                    st = item.stat(follow_symlinks=False)
-            except (OSError, ValueError):
-                continue
-            entries.append(_entry(prefix + item.name, st, islink))
+    dir_fd = None
+    if _SCANDIR_FD:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        dir_fd = _open_confined(real_root, real, normalized, flags)
+    try:
+        with os.scandir(dir_fd if dir_fd is not None else real) as iterator:
+            for item in iterator:
+                try:
+                    islink = item.is_symlink()
+                    if islink:
+                        # Links that are broken or point outside the root are not served,
+                        # so they are left out of listings as well.
+                        target = os.path.realpath(os.path.join(real, item.name))
+                        if not is_within(target, real_root):
+                            continue
+                        st = _stat_confined(real_root, target, prefix + item.name)
+                    else:
+                        st = item.stat(follow_symlinks=False)
+                except (OSError, ValueError, HTTPError):
+                    continue
+                entries.append(_entry(prefix + item.name, st, islink))
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
     entries.sort(key=lambda entry: entry["name"])
     return entries
-
-
-def _fd_real_path(fd: int) -> str | None:
-    """Best-effort real path of an open descriptor (Linux only)."""
-    link = f"/proc/self/fd/{fd}"
-    try:
-        return os.readlink(link)
-    except OSError:
-        return None
 
 
 def open_regular_file(real_root: str, client_path: str):
@@ -227,21 +301,16 @@ def open_regular_file(real_root: str, client_path: str):
         raise HTTPError(HTTPStatus.FORBIDDEN, "forbidden", f"not a regular file: {normalized}")
 
     flags = os.O_RDONLY
-    for name in ("O_NOFOLLOW", "O_NONBLOCK", "O_CLOEXEC", "O_BINARY", "O_NOCTTY"):
+    for name in ("O_NONBLOCK", "O_BINARY", "O_NOCTTY"):
         flags |= getattr(os, name, 0)
     try:
-        fd = os.open(real, flags)
+        fd = _open_confined(real_root, real, normalized, flags)
     except OSError as exc:
         raise _os_error_to_http(exc, normalized) from exc
     try:
         st = os.fstat(fd)
         if not stat_module.S_ISREG(st.st_mode):
             raise HTTPError(HTTPStatus.FORBIDDEN, "forbidden", f"not a regular file: {normalized}")
-        opened = _fd_real_path(fd)
-        if opened is not None and not is_within(opened, real_root):
-            raise HTTPError(
-                HTTPStatus.FORBIDDEN, "forbidden", f"path is outside the root: {normalized}"
-            )
         return os.fdopen(fd, "rb", buffering=0), st
     except BaseException:
         os.close(fd)
@@ -260,12 +329,21 @@ class CFDSServer(ThreadingHTTPServer):
         root: str | os.PathLike,
         token: str | None = None,
         ssl_context: ssl.SSLContext | None = None,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
+        allowed_hosts: tuple[str, ...] | list[str] = (),
     ):
         root = os.fspath(root)
         if not os.path.isdir(root):
             raise NotADirectoryError(f"root is not a directory: {root}")
         self.real_root = os.path.realpath(root)
-        self.token = token or None
+        self.token = validate_token(token) if token else None
+        if max_connections < 1:
+            raise ValueError("max_connections must be at least 1")
+        self.max_connections = int(max_connections)
+        self._slots = threading.BoundedSemaphore(self.max_connections)
+        self._connections: set = set()
+        self._connections_lock = threading.Lock()
+        self.allowed_hosts = self._default_hosts() | {host.lower() for host in allowed_hosts}
         if ":" in address[0]:
             self.address_family = socket.AF_INET6
         super().__init__(address, CFDSRequestHandler)
@@ -277,9 +355,80 @@ class CFDSServer(ThreadingHTTPServer):
             )
         self.uses_tls = ssl_context is not None
 
+    @staticmethod
+    def _default_hosts() -> set[str]:
+        hosts = {"localhost"}
+        try:
+            hosts.add(socket.gethostname().lower())
+            hosts.add(socket.getfqdn().lower())
+        except OSError:
+            pass
+        return hosts
+
+    def host_allowed(self, host_header: str | None) -> bool:
+        """Whether an anonymous request with this ``Host`` header may be served.
+
+        A web page on another site can make a visitor's browser send requests to this
+        server by pointing its own DNS name at the server's address ("DNS rebinding").
+        Such requests always carry the attacker's domain in ``Host``. IP addresses,
+        single-label names, this machine's own names and names passed as
+        ``allowed_hosts`` are accepted; other dotted names are not. Only enforced when
+        no token is configured, since a browser cannot supply the token.
+        """
+        if self.token is not None:
+            return True
+        if not host_header:
+            return True  # HTTP/1.0 clients; browsers always send Host
+        try:
+            hostname = urlsplit("//" + host_header.strip()).hostname or ""
+        except ValueError:
+            return False
+        hostname = hostname.lower().rstrip(".")
+        if hostname in self.allowed_hosts or "." not in hostname and ":" not in hostname:
+            return True
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            return False
+        return True
+
     @property
     def port(self) -> int:
         return self.server_address[1]
+
+    # -- connection accounting ----------------------------------------------------
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            # Full. Dropping the connection keeps one client (or a port scanner) from
+            # using up every thread and descriptor.
+            logger.warning(
+                "connection limit (%d) reached; refusing %s",
+                self.max_connections,
+                client_address[0],
+            )
+            self.shutdown_request(request)
+            return
+        with self._connections_lock:
+            self._connections.add(request)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._release(request)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._release(request)
+
+    def _release(self, request) -> None:
+        with self._connections_lock:
+            if request not in self._connections:
+                return
+            self._connections.discard(request)
+        self._slots.release()
 
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]
@@ -287,6 +436,17 @@ class CFDSServer(ThreadingHTTPServer):
             logger.debug("connection from %s dropped: %s", client_address[0], exc)
         else:
             logger.exception("error handling a request from %s", client_address[0])
+
+    def server_close(self):
+        """Stop listening and drop every connection that is still open."""
+        super().server_close()
+        with self._connections_lock:
+            connections = list(self._connections)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
 
 class CFDSRequestHandler(BaseHTTPRequestHandler):
@@ -300,6 +460,7 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
     disable_nagle_algorithm = True
 
     server: CFDSServer
+    _response_started = False
 
     # -- plumbing ---------------------------------------------------------------
 
@@ -310,6 +471,33 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
     def send_response(self, code, message=None):
         self._response_started = True
         super().send_response(code, message)
+
+    def end_headers(self):
+        if self.close_connection:
+            # Tell the client, so it does not try to reuse a connection we are closing.
+            self.send_header("Connection", "close")
+        super().end_headers()
+
+    def handle_expect_100(self):
+        # Never invite a request body: nothing this server accepts has one.
+        return True
+
+    def send_error(self, code, message=None, explain=None):
+        """Protocol-level errors raised by the base class, in the same JSON shape as ours."""
+        self.close_connection = True
+        if code == HTTPStatus.NOT_IMPLEMENTED:
+            code, error_code = HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed"
+            message = "this server is read-only; use GET or HEAD"
+            headers = {"Allow": "GET, HEAD"}
+        else:
+            error_code, headers = "bad_request", {}
+        if not getattr(self, "command", None):
+            self.command = "GET"  # the request line was not parsed; a body is still fine
+        if getattr(self, "request_version", "HTTP/0.9") == "HTTP/0.9":
+            # Older Pythons leave an unparsable request marked HTTP/0.9, which makes
+            # send_response() skip the status line and headers altogether.
+            self.request_version = "HTTP/1.0"
+        self._send_error_json(HTTPError(code, error_code, message or "bad request", headers))
 
     def _send_json(self, status: int, payload: dict, headers: dict | None = None) -> None:
         body = json.dumps(payload).encode("ascii")
@@ -335,8 +523,9 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
         scheme, _, supplied = self.headers.get("Authorization", "").partition(" ")
         if scheme.lower() != "bearer":
             return False
+        # Header values arrive decoded as Latin-1; tokens are restricted to ASCII.
         return hmac.compare_digest(
-            supplied.strip().encode("utf-8", "surrogateescape"), expected.encode("utf-8")
+            supplied.strip().encode("latin-1", "replace"), expected.encode("ascii")
         )
 
     def _path_param(self, params: dict, default: str | None = None) -> str:
@@ -349,6 +538,30 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
             raise HTTPError(HTTPStatus.BAD_REQUEST, "bad_request", "'path' given more than once")
         return values[0]
 
+    def _has_request_body(self) -> bool:
+        """True if a body might follow the headers, including when we cannot be sure."""
+        if self.headers.defects or self.headers.get("Transfer-Encoding"):
+            return True
+        lengths = self.headers.get_all("Content-Length", [])
+        return len(lengths) > 1 or any(value.strip() != "0" for value in lengths)
+
+    def _drain_request_body(self) -> None:
+        """Read and discard a small request body so the client can read our refusal."""
+        lengths = self.headers.get_all("Content-Length", [])
+        if len(lengths) != 1 or not lengths[0].strip().isdigit():
+            return
+        if "100-continue" in self.headers.get("Expect", "").lower():
+            return  # the client is waiting for a go-ahead and has not sent the body
+        remaining = min(int(lengths[0]), MAX_DRAIN)
+        try:
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 64 * 1024))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except OSError:
+            pass
+
     # -- dispatch ---------------------------------------------------------------
 
     def do_GET(self):  # noqa: N802
@@ -358,26 +571,28 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
         self._dispatch()
 
     def _reject_method(self):
-        # A request body may follow that we will not read, so drop the connection.
-        self.close_connection = True
         self._response_started = False
-        self._send_error_json(
-            HTTPError(
-                HTTPStatus.METHOD_NOT_ALLOWED,
-                "method_not_allowed",
-                "this server is read-only; use GET or HEAD",
-                headers={"Allow": "GET, HEAD"},
+        self.close_connection = True
+        self._drain_request_body()
+        try:
+            self._send_error_json(
+                HTTPError(
+                    HTTPStatus.METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    "this server is read-only; use GET or HEAD",
+                    headers={"Allow": "GET, HEAD"},
+                )
             )
-        )
+        except OSError:
+            pass
 
     do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _reject_method  # noqa: N815
 
     def _dispatch(self) -> None:
         self._response_started = False
-        if self.headers.get("Content-Length", "0").strip() not in ("", "0") or self.headers.get(
-            "Transfer-Encoding"
-        ):
-            # We never read request bodies; do not let one poison a kept-alive connection.
+        if self._has_request_body():
+            # We never read request bodies; do not let one be mistaken for a second
+            # request on a kept-alive connection.
             self.close_connection = True
         try:
             if not self._authorized():
@@ -387,9 +602,15 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
                     "a valid bearer token is required",
                     headers={"WWW-Authenticate": 'Bearer realm="cfds"'},
                 )
-            split = urlsplit(self.path)
-            route = split.path.rstrip("/")
+            if not self.server.host_allowed(self.headers.get("Host")):
+                raise HTTPError(
+                    HTTPStatus.MISDIRECTED_REQUEST,
+                    "host_not_allowed",
+                    "this host name is not allowed without a token; start cfds-server with "
+                    "--allowed-host <name>, or configure a token",
+                )
             try:
+                split = urlsplit(self.path)
                 params = parse_qs(
                     split.query,
                     keep_blank_values=True,
@@ -398,7 +619,8 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
                     errors="surrogateescape",
                 )
             except ValueError as exc:
-                raise HTTPError(HTTPStatus.BAD_REQUEST, "bad_request", "bad query string") from exc
+                raise HTTPError(HTTPStatus.BAD_REQUEST, "bad_request", "bad request URL") from exc
+            route = split.path.rstrip("/")
             if route == f"{API_PREFIX}/ls":
                 self._handle_ls(params)
             elif route == f"{API_PREFIX}/file":
@@ -443,7 +665,15 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
                     "the file changed since it was opened",
                     headers={"ETag": etag},
                 )
-            byte_range = parse_range(self.headers.get("Range"), size)
+            range_header = self.headers.get("Range")
+            if_range = self.headers.get("If-Range")
+            if if_range is not None and if_range.strip() != etag:
+                range_header = None  # RFC 9110 13.1.5: stale validator, send everything
+            byte_range = parse_range(range_header, size)
+            try:
+                last_modified = formatdate(st.st_mtime, usegmt=True)
+            except (ValueError, OverflowError, OSError):
+                last_modified = None  # a timestamp HTTP cannot express
             if byte_range is None:
                 start, length = 0, size
                 self.send_response(HTTPStatus.OK)
@@ -456,7 +686,8 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(length))
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("ETag", etag)
-            self.send_header("Last-Modified", formatdate(st.st_mtime, usegmt=True))
+            if last_modified is not None:
+                self.send_header("Last-Modified", last_modified)
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -466,9 +697,12 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
             remaining = length
             while remaining > 0:
                 chunk = handle.read(min(CHUNK_SIZE, remaining))
-                if not chunk:
-                    # The file shrank underneath us. The declared length can no longer be
-                    # met, so close the connection and let the client see a short read.
+                # If the file shrank, or was modified since the headers were sent, the
+                # promised bytes can no longer be delivered. Stop without sending this
+                # chunk and close, so the client sees an incomplete transfer rather than
+                # a full-length mix of old and new content.
+                if not chunk or make_etag(os.fstat(handle.fileno())) != etag:
+                    logger.warning("%r changed while it was being sent; closing", path)
                     self.close_connection = True
                     return
                 self.wfile.write(chunk)
@@ -482,15 +716,25 @@ def make_server(
     token: str | None = None,
     certfile: str | None = None,
     keyfile: str | None = None,
+    max_connections: int = DEFAULT_MAX_CONNECTIONS,
+    allowed_hosts: tuple[str, ...] | list[str] = (),
 ) -> CFDSServer:
     """Create (but do not start) a server. Call ``serve_forever()`` on the result."""
     ssl_context = None
     if certfile:
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
         ssl_context.load_cert_chain(certfile, keyfile)
     elif keyfile:
         raise ValueError("keyfile was given without certfile")
-    return CFDSServer((host, port), root, token=token, ssl_context=ssl_context)
+    return CFDSServer(
+        (host, port),
+        root,
+        token=token,
+        ssl_context=ssl_context,
+        max_connections=max_connections,
+        allowed_hosts=allowed_hosts,
+    )
 
 
 def _is_loopback(host: str) -> bool:
@@ -502,9 +746,53 @@ def _read_token(args: argparse.Namespace) -> str | None:
         with open(args.token_file, encoding="utf-8") as handle:
             token = handle.read().strip()
         if not token:
-            raise SystemExit(f"token file is empty: {args.token_file}")
+            raise ValueError(f"token file is empty: {args.token_file}")
         return token
     return os.environ.get("CFDS_TOKEN") or None
+
+
+def _port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError:
+        port = -1
+    if not 0 <= port <= 65535:
+        raise argparse.ArgumentTypeError(f"not a port number (0-65535): {value!r}")
+    return port
+
+
+def _positive(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        number = 0
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"not a positive integer: {value!r}")
+    return number
+
+
+def _ensure_descriptors(max_connections: int) -> None:
+    """Raise the open-file limit if the connection cap would not fit under it."""
+    try:
+        import resource
+    except ImportError:  # not available on Windows
+        return
+    needed = max_connections * 2 + 64
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY or soft >= needed:
+        return
+    target = needed if hard == resource.RLIM_INFINITY else min(needed, hard)
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except (ValueError, OSError):
+        target = soft
+    if target < needed:
+        logger.warning(
+            "the open-file limit (%d) is low for --max-connections %d; "
+            "raise it with 'ulimit -n' or lower --max-connections",
+            target,
+            max_connections,
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -522,14 +810,34 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_HOST,
         help="address to bind; use 0.0.0.0 to accept remote clients (default: %(default)s)",
     )
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="default: %(default)s")
+    parser.add_argument("--port", type=_port, default=DEFAULT_PORT, help="default: %(default)s")
     parser.add_argument(
         "--token-file",
         help="file holding the bearer token clients must send (or set $CFDS_TOKEN)",
     )
     parser.add_argument("--certfile", help="TLS certificate (PEM); enables HTTPS")
     parser.add_argument("--keyfile", help="TLS private key (PEM), if not in --certfile")
-    parser.add_argument("--log-level", default="INFO", help="default: %(default)s")
+    parser.add_argument(
+        "--allowed-host",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="extra DNS name clients may use for this server when no token is set "
+        "(repeatable; IP addresses and single-label names are always allowed)",
+    )
+    parser.add_argument(
+        "--max-connections",
+        type=_positive,
+        default=DEFAULT_MAX_CONNECTIONS,
+        help="connections served at once; more are refused (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str.upper,
+        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+        default="INFO",
+        help="default: %(default)s",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
@@ -537,14 +845,24 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(
-        level=args.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+        level=args.log_level, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    token = _read_token(args)
     try:
-        server = make_server(args.root, args.host, args.port, token, args.certfile, args.keyfile)
-    except (OSError, ValueError, ssl.SSLError) as exc:
+        token = _read_token(args)
+        server = make_server(
+            args.root,
+            args.host,
+            args.port,
+            token,
+            args.certfile,
+            args.keyfile,
+            max_connections=args.max_connections,
+            allowed_hosts=args.allowed_host,
+        )
+    except (OSError, ValueError, OverflowError, ssl.SSLError) as exc:
         print(f"cfds-server: {exc}", file=sys.stderr)
         return 2
+    _ensure_descriptors(server.max_connections)
     if token is None and not _is_loopback(args.host):
         logger.warning(
             "no token configured: anyone who can reach %s:%s can read %s",

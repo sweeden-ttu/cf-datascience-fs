@@ -20,17 +20,18 @@ classifiers = [
 dependencies = [
     "fsspec>=2024.2.0",
     "requests>=2.25",
+    "urllib3>=1.26",
 ]
 
 [project.optional-dependencies]
 test = [
-    "pytest>=7",
+    "pytest>=7.3",
     "pandas",
     "pyarrow",
 ]
 dev = [
     "cf-datascience-fs[test]",
-    "ruff",
+    "ruff==0.17.*",
 ]
 
 [project.urls]
@@ -53,10 +54,16 @@ packages = ["src/cf_datascience_fs"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+# The test drive holds a 5 MiB file; do not keep a copy per test after the run.
+tmp_path_retention_policy = "none"
 
 [tool.ruff]
 line-length = 100
 target-version = "py39"
+
+[tool.ruff.format]
+# Code samples in the README use aligned trailing comments.
+exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]
