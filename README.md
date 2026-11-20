@@ -9,6 +9,8 @@ There are two parts:
   serves it **read-only** over HTTP. It needs only the Python standard library.
 - **`cfds://`** is an fsspec filesystem that data scientists use from their own machines.
   Anything that understands fsspec URLs (pandas, pyarrow, Dask, xarray, ...) can read from it.
+- **[`ios/`](ios/README.md)** is an iPhone app with a File Provider extension that shows the
+  same storage in the iOS Files app, with sign-up and sign-in through Cloudfronts OIDC.
 
 ## Install
 

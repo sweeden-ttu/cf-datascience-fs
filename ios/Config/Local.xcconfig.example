@@ -1,0 +1,4 @@
+// Copy to Config/Local.xcconfig and fill in. That file is git-ignored.
+DEVELOPMENT_TEAM = ABCDE12345
+// Point at a test server, for example:
+// CFDS_API_BASE_URL = https:/$()/staging.storage.cloudfronts.group

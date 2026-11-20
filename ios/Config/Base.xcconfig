@@ -1,0 +1,25 @@
+// Settings shared by the app and the File Provider extension.
+// Put your own team id and overrides in Config/Local.xcconfig (git-ignored).
+//
+// In xcconfig files "//" starts a comment, so URLs are written as "https:/$()/host".
+
+CFDS_BUNDLE_ID = com.cloudfronts.datascientist
+CFDS_APP_GROUP = group.com.cloudfronts.datascientist
+// Keychain group shared by both targets. The team id prefix is added in the entitlements.
+CFDS_KEYCHAIN_GROUP = com.cloudfronts.datascientist.shared
+
+// OIDC provider and the public client registered for this app (PKCE, no secret).
+CFDS_ISSUER = https:/$()/oidc.cloudfronts.group
+CFDS_CLIENT_ID = cfds-ios
+CFDS_REDIRECT_URI = groups.cloudfronts.datascientist:/oauth2/callback
+CFDS_SCOPES = openid profile email
+
+// The cfds storage server and the public sign-up site.
+CFDS_API_BASE_URL = https:/$()/storage.cloudfronts.group
+CFDS_SIGNUP_WEB_URL = https:/$()/datascientist.cloudfronts.group
+
+DEVELOPMENT_TEAM =
+MARKETING_VERSION = 1.0
+CURRENT_PROJECT_VERSION = 1
+
+#include? "Local.xcconfig"
