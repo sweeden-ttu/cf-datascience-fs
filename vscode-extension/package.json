@@ -1,0 +1,155 @@
+{
+  "name": "cfds",
+  "displayName": "Cloudfronts Data Science Storage",
+  "description": "Browse, open and edit your Cloudfronts storage (cfds://) and the shared Kaggle datasets right in the VS Code Explorer. Works locally, in Remote/Kubernetes dev containers and on vscode.dev.",
+  "version": "0.1.0",
+  "publisher": "cloudfronts",
+  "license": "Apache-2.0",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sweeden-ttu/cf-datascience-fs.git",
+    "directory": "vscode-extension"
+  },
+  "bugs": {
+    "url": "https://github.com/sweeden-ttu/cf-datascience-fs/issues"
+  },
+  "homepage": "https://datascientist.cloudfronts.group",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Data Science",
+    "Other"
+  ],
+  "keywords": [
+    "filesystem",
+    "storage",
+    "kaggle",
+    "datasets",
+    "fsspec",
+    "cloud",
+    "kubernetes",
+    "remote"
+  ],
+  "extensionKind": [
+    "ui",
+    "workspace"
+  ],
+  "capabilities": {
+    "virtualWorkspaces": true,
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
+  "activationEvents": [
+    "onFileSystem:cfds",
+    "onAuthenticationRequest:cloudfronts",
+    "onStartupFinished"
+  ],
+  "main": "./dist/node/extension.js",
+  "browser": "./dist/web/extension.js",
+  "contributes": {
+    "authentication": [
+      {
+        "id": "cloudfronts",
+        "label": "Cloudfronts"
+      }
+    ],
+    "commands": [
+      {
+        "command": "cfds.open",
+        "title": "Open Cloudfronts Storage",
+        "category": "Cloudfronts"
+      },
+      {
+        "command": "cfds.signIn",
+        "title": "Sign In",
+        "category": "Cloudfronts"
+      },
+      {
+        "command": "cfds.signUp",
+        "title": "Sign Up (Free 100 GB)",
+        "category": "Cloudfronts"
+      },
+      {
+        "command": "cfds.signOut",
+        "title": "Sign Out",
+        "category": "Cloudfronts"
+      },
+      {
+        "command": "cfds.showQuota",
+        "title": "Show Storage Usage",
+        "category": "Cloudfronts"
+      }
+    ],
+    "configuration": {
+      "title": "Cloudfronts Storage",
+      "properties": {
+        "cfds.serverUrl": {
+          "type": "string",
+          "default": "https://storage.cloudfronts.group",
+          "description": "Base URL of the cfds storage server."
+        },
+        "cfds.oidc.issuer": {
+          "type": "string",
+          "default": "https://oidc.cloudfronts.group",
+          "description": "OpenID Connect issuer used to sign in."
+        },
+        "cfds.oidc.clientId": {
+          "type": "string",
+          "default": "cfds-vscode",
+          "description": "OAuth client id registered with the issuer (public client, PKCE)."
+        },
+        "cfds.oidc.scopes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "openid",
+            "profile",
+            "email"
+          ],
+          "description": "Scopes requested at sign-in."
+        },
+        "cfds.signUpUrl": {
+          "type": "string",
+          "default": "https://datascientist.cloudfronts.group/signup",
+          "description": "Page that creates a free account."
+        },
+        "cfds.defaultFolders": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Folders to add to the workspace on 'Open Cloudfronts Storage'. Empty means the server's mounts: the shared Kaggle datasets and your home folder."
+        },
+        "cfds.maxFileSizeMB": {
+          "type": "number",
+          "default": 512,
+          "description": "Refuse to open files larger than this in the editor (they are still listed). Use the Python cfds client for bigger files."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "package": "vsce package --no-dependencies",
+    "publish": "vsce publish --no-dependencies",
+    "vscode:prepublish": "node esbuild.mjs --production",
+    "test:e2e": "npm run build && node test/e2e/runTest.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "1.85.0",
+    "@vscode/vsce": "^3.2.0",
+    "esbuild": "^0.24.0",
+    "typescript": "~5.6.0",
+    "@vscode/test-electron": "^2.4.1"
+  }
+}

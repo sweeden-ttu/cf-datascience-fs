@@ -3,7 +3,7 @@
 CloudFronts Data Science file system: browse, read and write a remote storage drive,
 including large blobs, from Python through [fsspec](https://filesystem-spec.readthedocs.io/).
 
-There are three parts:
+These are the parts:
 
 - **`cfds-server`** runs on the machine that has the drive. It serves either one directory
   (for example `/mnt/TMP`), or, for the hosted service, a private space per signed-in user
@@ -13,6 +13,10 @@ There are three parts:
   Anything that understands fsspec URLs (pandas, pyarrow, Dask, xarray, ...) can read and
   write through it, from ordinary or `async` code.
 - **`cfds login`** signs in through the browser and saves a token for the filesystem.
+- **[`vscode-extension/`](vscode-extension/README.md)** shows the same storage in VS Code
+  (`cfds:` file system), with Cloudfronts sign-in.
+- **[`ios/`](ios/README.md)** is an iPhone app with a File Provider extension that shows the
+  same storage in the iOS Files app, with sign-up and sign-in through Cloudfronts OIDC.
 
 The HTTP protocol, shared with the VS Code extension and the iOS app, is in
 [docs/API.md](docs/API.md). How the hosted service is set up is in
