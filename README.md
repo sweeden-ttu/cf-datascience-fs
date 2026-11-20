@@ -17,6 +17,12 @@ There are three parts:
 The HTTP protocol, shared with the VS Code extension and the iOS app, is in
 [docs/API.md](docs/API.md). How the hosted service is set up is in
 [docs/DEPLOY.md](docs/DEPLOY.md).
+- **`cfds-server`** runs on the machine that has the drive (for example `/mnt/TMP`) and
+  serves it **read-only** over HTTP. It needs only the Python standard library.
+- **`cfds://`** is an fsspec filesystem that data scientists use from their own machines.
+  Anything that understands fsspec URLs (pandas, pyarrow, Dask, xarray, ...) can read from it.
+- **[`ios/`](ios/README.md)** is an iPhone app with a File Provider extension that shows the
+  same storage in the iOS Files app, with sign-up and sign-in through Cloudfronts OIDC.
 
 ## Install
 
