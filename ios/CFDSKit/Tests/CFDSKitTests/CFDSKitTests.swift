@@ -6,7 +6,7 @@ final class PKCETests: XCTestCase {
     func testChallengeMatchesRFC7636AppendixB() {
         // The worked example from RFC 7636, Appendix B.
         let pkce = PKCE(verifier: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")
-        XCTAssertEqual(pkce.challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGeSJ3TM-cM")
+        XCTAssertEqual(pkce.challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
         XCTAssertEqual(pkce.method, "S256")
     }
 
