@@ -1,0 +1,45 @@
+name: VS Code extension
+
+on:
+  push:
+    branches: [main]
+    paths: ["vscode-extension/**", "src/**", ".github/workflows/vscode-extension.yml"]
+  pull_request:
+    paths: ["vscode-extension/**", "src/**", ".github/workflows/vscode-extension.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vscode-ext-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: vscode-extension
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the Python server (reads in the unit tests run against it)
+        run: python -m pip install -e ..
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: End-to-end in a real VS Code
+        run: xvfb-run -a npm run test:e2e
+      - run: npm run package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cfds-vsix
+          path: vscode-extension/*.vsix
