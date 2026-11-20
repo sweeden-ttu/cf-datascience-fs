@@ -1,27 +1,30 @@
-"""Read-only HTTP server that exposes one directory tree to :mod:`cf_datascience_fs.core`.
+"""HTTP server for the :mod:`cf_datascience_fs` client (``cfds://``).
 
-This module imports only the standard library. There are two endpoints, both ``GET``
-(and ``HEAD``) only:
+The protocol is described in ``docs/API.md``. In short, under ``/v1``:
 
-``/v1/ls?path=<path>[&list=0]``
-    JSON description of ``path``: ``{"info": {...}, "entries": [...] | null}``.
-    ``entries`` is the directory listing, or ``null`` for a file or when ``list=0``.
+``GET /ls?path=P``                  JSON description of ``P`` and its entries
+``GET /file?path=P``                the file's bytes (``Range``, ``If-Match``, ``If-Range``)
+``PUT /file?path=P``                create or replace a file atomically
+``DELETE /file?path=P``             delete a file or directory
+``POST /mkdir``, ``/mv``, ``/cp``   make a directory, rename, copy one file
+``GET /me``                         who the caller is, their quota and their mounts
 
-``/v1/file?path=<path>``
-    The file's bytes. Honours a single ``Range: bytes=...`` header (``206``), an
-    ``If-Match: <etag>`` precondition (``412`` when the file changed) and ``If-Range``.
-    If the file changes while it is being sent, the connection is cut short so the
-    client sees an incomplete transfer instead of a mix of old and new bytes.
+There are two ways to run it:
 
-Paths are POSIX style and relative to the served root. Every path is resolved with
-symlinks followed and must stay inside the root; anything else is refused.
+Single tree (``--root``)
+    One directory at ``/``, read-only unless ``--writable``. Optionally protected by a
+    shared token.
+Multi-user (``--users-root``)
+    Every caller signs in with an OpenID Connect provider (``--oidc-issuer``) and sees
+    ``/kaggle-datasets`` (shared, read-only) and ``/home`` (their own space, with a
+    quota). ``/`` is virtual and lists the two.
+
+This module imports only the standard library, plus PyJWT when ``--oidc-issuer`` is used.
 """
 
 from __future__ import annotations
 
 import argparse
-import errno
-import hmac
 import ipaddress
 import json
 import logging
@@ -29,8 +32,6 @@ import os
 import re
 import socket
 import ssl
-import stat as stat_module
-import string
 import sys
 import threading
 from email.utils import formatdate
@@ -38,14 +39,57 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+from . import _fsops
+from ._auth import Identity, NoAuth, OIDCAuth, StaticTokenAuth, validate_token
+from ._fsops import (
+    HTTPError,
+    delete_path,
+    describe,
+    is_within,
+    make_directory,
+    make_etag,
+    move_path,
+    open_regular_file,
+    parse_range,
+    read_only,
+    resolve_path,
+    write_file,
+)
+from ._namespace import Mount, Namespace
+from ._users import DEFAULT_QUOTA, UserStore
 from ._version import __version__
+
+__all__ = [
+    "CFDSServer",
+    "HTTPError",
+    "describe",
+    "is_within",
+    "main",
+    "make_etag",
+    "make_server",
+    "open_regular_file",
+    "parse_range",
+    "resolve_path",
+    "validate_token",
+]
 
 logger = logging.getLogger("cf_datascience_fs.server")
 
 API_PREFIX = "/v1"
 DEFAULT_ROOT = "/mnt/TMP"
+DEFAULT_DATASETS_ROOT = "/mnt/TMP/ai-rig/kaggle-datasets"
+DATASETS_MOUNT = "/kaggle-datasets"
+HOME_MOUNT = "/home"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+#: Client IDs registered at the OIDC provider for the cfds apps.
+DEFAULT_AUDIENCES = ("cfds-vscode", "cfds-ios", "cfds-cli")
+#: Browser origins allowed by default when callers must sign in (VS Code for the Web).
+DEFAULT_CORS_ORIGINS = (
+    "https://vscode.dev",
+    "https://insiders.vscode.dev",
+    "https://*.vscode-cdn.net",
+)
 CHUNK_SIZE = 1024 * 1024
 #: Seconds a connection may sit idle (or stall mid-transfer) before it is dropped.
 SOCKET_TIMEOUT = 120
@@ -53,272 +97,38 @@ SOCKET_TIMEOUT = 120
 DEFAULT_MAX_CONNECTIONS = 256
 #: How much of an unwanted request body is read and thrown away before closing.
 MAX_DRAIN = 1024 * 1024
-_TOKEN_CHARS = frozenset(string.ascii_letters + string.digits + "-._~+/=")
+PROTECTED_RESOURCE_PATH = "/.well-known/oauth-protected-resource"
 
-_RANGE_RE = re.compile(r"\s*bytes\s*=\s*(\d{0,18})\s*-\s*(\d{0,18})\s*", re.ASCII)
-_NOT_FOUND_ERRNOS = {errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.ENAMETOOLONG}
-
-
-class HTTPError(Exception):
-    """An error that maps directly onto an HTTP error response."""
-
-    def __init__(self, status: int, code: str, message: str, headers: dict | None = None):
-        super().__init__(message)
-        self.status = int(status)
-        self.code = code
-        self.message = message
-        self.headers = headers or {}
-
-
-def _os_error_to_http(exc: OSError, path: str) -> HTTPError:
-    if isinstance(exc, PermissionError) or exc.errno in (errno.EACCES, errno.EPERM):
-        return HTTPError(HTTPStatus.FORBIDDEN, "forbidden", f"permission denied: {path}")
-    if exc.errno in _NOT_FOUND_ERRNOS:
-        return HTTPError(HTTPStatus.NOT_FOUND, "not_found", f"no such file or directory: {path}")
-    logger.warning("unexpected OS error for %r: %s", path, exc)
-    return HTTPError(HTTPStatus.INTERNAL_SERVER_ERROR, "io_error", f"I/O error reading {path}")
+_READ = ("GET", "HEAD")
+_ROUTES = {
+    f"{API_PREFIX}/ls": _READ,
+    f"{API_PREFIX}/file": ("GET", "HEAD", "PUT", "DELETE"),
+    f"{API_PREFIX}/me": _READ,
+    f"{API_PREFIX}/mkdir": ("POST",),
+    f"{API_PREFIX}/mv": ("POST",),
+    f"{API_PREFIX}/cp": ("POST",),
+    PROTECTED_RESOURCE_PATH: _READ,
+}
+_CORS_ALLOW_HEADERS = "Authorization, Range, If-Match, If-None-Match, If-Range, Content-Type"
+_CORS_EXPOSE_HEADERS = (
+    "ETag, Content-Length, Content-Range, Last-Modified, Accept-Ranges, WWW-Authenticate"
+)
+_HEX = re.compile(rb"[0-9A-Fa-f]{1,16}")
 
 
-def is_within(real_path: str, real_root: str) -> bool:
-    """True if ``real_path`` is ``real_root`` or below it. Both must be resolved paths."""
-    if real_path == real_root:
-        return True
-    prefix = real_root if real_root.endswith(os.sep) else real_root + os.sep
-    return real_path.startswith(prefix)
-
-
-def resolve_path(real_root: str, client_path: str) -> tuple[str, str]:
-    """Map a client path onto the local file system.
-
-    Returns ``(normalized_client_path, real_local_path)``. The normalized path always
-    starts with ``/`` and has no empty, ``.`` or ``..`` segments. Raises
-    :class:`HTTPError` for malformed paths and for paths whose resolved location
-    (symlinks followed) falls outside ``real_root``.
-    """
-    if "\x00" in client_path:
-        raise HTTPError(HTTPStatus.BAD_REQUEST, "bad_request", "path contains a NUL byte")
-    parts = [part for part in client_path.split("/") if part not in ("", ".")]
-    if ".." in parts:
-        raise HTTPError(HTTPStatus.BAD_REQUEST, "bad_request", "'..' is not allowed in paths")
-    if os.sep != "/" and any(os.sep in part or ":" in part for part in parts):
-        raise HTTPError(HTTPStatus.BAD_REQUEST, "bad_request", "invalid character in path")
-    normalized = "/" + "/".join(parts)
-    try:
-        real = os.path.realpath(os.path.join(real_root, *parts))
-    except (OSError, ValueError) as exc:
-        raise HTTPError(HTTPStatus.NOT_FOUND, "not_found", f"cannot resolve: {normalized}") from exc
-    if not is_within(real, real_root):
-        raise HTTPError(
-            HTTPStatus.FORBIDDEN, "forbidden", f"path is outside the root: {normalized}"
-        )
-    return normalized, real
-
-
-def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
-    """Parse a ``Range`` header against a file of ``size`` bytes.
-
-    Returns ``(start, end)`` with ``end`` inclusive, or ``None`` when the whole file
-    should be sent (no header, or a header we do not understand, which RFC 9110 lets a
-    server ignore). Raises :class:`HTTPError` 416 when the range cannot be satisfied.
-    """
-    if not header:
-        return None
-    match = _RANGE_RE.fullmatch(header)
-    if match is None:
-        return None
-    first, last = match.groups()
-    if not first and not last:
-        return None
-    unsatisfiable = HTTPError(
-        HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE,
-        "range_not_satisfiable",
-        f"range {header.strip()!r} cannot be satisfied for a file of {size} bytes",
-        headers={"Content-Range": f"bytes */{size}"},
-    )
-    if not first:  # suffix range: the last N bytes
-        length = int(last)
-        if length == 0 or size == 0:
-            raise unsatisfiable
-        return max(0, size - length), size - 1
-    start = int(first)
-    if last and int(last) < start:
-        return None
-    if start >= size:
-        raise unsatisfiable
-    end = min(int(last), size - 1) if last else size - 1
-    return start, end
-
-
-def make_etag(st: os.stat_result) -> str:
-    """Validator built from mtime, size and inode.
-
-    It changes when a file is rewritten or replaced, as far as the file system's
-    timestamp resolution can tell: a same-size rewrite within one timestamp tick of
-    the previous write is not distinguishable.
-    """
-    return f'"{st.st_mtime_ns:x}-{st.st_size:x}-{st.st_ino:x}"'
-
-
-def validate_token(token: str) -> str:
-    """Bearer tokens must be plain ASCII (RFC 6750) so every HTTP client sends the same bytes."""
-    if not token or not set(token) <= _TOKEN_CHARS:
-        raise ValueError(
-            "the token must be non-empty and use only letters, digits and -._~+/= characters"
-        )
-    return token
-
-
-def _etag_matches(header: str, etag: str) -> bool:
-    candidates = [item.strip() for item in header.split(",")]
-    return "*" in candidates or etag in candidates
-
-
-def _entry(name: str, st: os.stat_result, islink: bool) -> dict:
-    if stat_module.S_ISDIR(st.st_mode):
-        kind, size = "directory", 0
-    elif stat_module.S_ISREG(st.st_mode):
-        kind, size = "file", st.st_size
-    else:
-        kind, size = "other", 0
-    entry = {"name": name, "size": size, "type": kind, "mtime": st.st_mtime, "islink": islink}
-    if kind == "file":
-        entry["etag"] = make_etag(st)
-    return entry
-
-
-_DIR_FD_OPEN = os.open in getattr(os, "supports_dir_fd", ())
-
-
-def _open_confined(real_root: str, real: str, normalized: str, flags: int) -> int:
-    """Open the already-resolved path ``real`` without following any symlink.
-
-    ``resolve_path`` checks a path *string*, and ``real`` contained no symlinks when it
-    was computed. Someone with write access to the tree could still swap a directory for
-    a symlink before the open. So the path is walked from the root one component at a
-    time, relative to the previous directory's descriptor, with ``O_NOFOLLOW``: a
-    component that has become a symlink makes the open fail instead of leading outside.
-    """
-    nofollow = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    if not _DIR_FD_OPEN:  # e.g. Windows: no descriptor-relative open available
-        return os.open(real, flags | nofollow)
-    parts = [] if real == real_root else os.path.relpath(real, real_root).split(os.sep)
-    directory = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
-    fd = os.open(real_root, directory if parts else flags | nofollow)
-    try:
-        for index, part in enumerate(parts):
-            last = index == len(parts) - 1
-            child = os.open(part, flags | nofollow if last else directory, dir_fd=fd)
-            os.close(fd)
-            fd = child
-        if stat_module.S_ISLNK(os.fstat(fd).st_mode):
-            # Only reachable with O_PATH, which opens a symlink itself rather than failing.
-            raise HTTPError(
-                HTTPStatus.FORBIDDEN, "forbidden", f"path is outside the root: {normalized}"
-            )
-    except BaseException:
-        os.close(fd)
-        raise
-    return fd
-
-
-_HAS_O_PATH = hasattr(os, "O_PATH")
-_SCANDIR_FD = os.scandir in getattr(os, "supports_fd", ())
-
-
-def _stat_confined(real_root: str, real: str, normalized: str) -> os.stat_result:
-    """``os.stat`` that cannot be tricked into describing something outside the root."""
-    if not _HAS_O_PATH:
-        return os.stat(real)  # no descriptor-based check available on this platform
-    fd = _open_confined(real_root, real, normalized, os.O_PATH)
-    try:
-        return os.fstat(fd)
-    finally:
-        os.close(fd)
-
-
-def describe(real_root: str, client_path: str, list_entries: bool = True) -> dict:
-    """Build the ``/v1/ls`` response body for ``client_path``."""
-    normalized, real = resolve_path(real_root, client_path)
-    try:
-        st = _stat_confined(real_root, real, normalized)
-        islink = normalized != "/" and os.path.islink(
-            os.path.join(real_root, *normalized.strip("/").split("/"))
-        )
-        info = _entry(normalized, st, islink)
-        entries = None
-        if list_entries and info["type"] == "directory":
-            entries = _list_directory(real_root, normalized, real)
-    except OSError as exc:
-        raise _os_error_to_http(exc, normalized) from exc
-    return {"info": info, "entries": entries}
-
-
-def _list_directory(real_root: str, normalized: str, real: str) -> list[dict]:
-    prefix = normalized.rstrip("/") + "/"
-    entries = []
-    dir_fd = None
-    if _SCANDIR_FD:
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        dir_fd = _open_confined(real_root, real, normalized, flags)
-    try:
-        with os.scandir(dir_fd if dir_fd is not None else real) as iterator:
-            for item in iterator:
-                try:
-                    islink = item.is_symlink()
-                    if islink:
-                        # Links that are broken or point outside the root are not served,
-                        # so they are left out of listings as well.
-                        target = os.path.realpath(os.path.join(real, item.name))
-                        if not is_within(target, real_root):
-                            continue
-                        st = _stat_confined(real_root, target, prefix + item.name)
-                    else:
-                        st = item.stat(follow_symlinks=False)
-                except (OSError, ValueError, HTTPError):
-                    continue
-                entries.append(_entry(prefix + item.name, st, islink))
-    finally:
-        if dir_fd is not None:
-            os.close(dir_fd)
-    entries.sort(key=lambda entry: entry["name"])
-    return entries
-
-
-def open_regular_file(real_root: str, client_path: str):
-    """Open ``client_path`` for reading. Returns ``(binary_file, stat_result)``.
-
-    Only regular files inside the root are opened. Devices, FIFOs and sockets are
-    refused, and a path swapped for a symlink between the check and the open is caught.
-    """
-    normalized, real = resolve_path(real_root, client_path)
-    try:
-        st = os.stat(real)
-    except OSError as exc:
-        raise _os_error_to_http(exc, normalized) from exc
-    if stat_module.S_ISDIR(st.st_mode):
-        raise HTTPError(HTTPStatus.BAD_REQUEST, "is_a_directory", f"is a directory: {normalized}")
-    if not stat_module.S_ISREG(st.st_mode):
-        raise HTTPError(HTTPStatus.FORBIDDEN, "forbidden", f"not a regular file: {normalized}")
-
-    flags = os.O_RDONLY
-    for name in ("O_NONBLOCK", "O_BINARY", "O_NOCTTY"):
-        flags |= getattr(os, name, 0)
-    try:
-        fd = _open_confined(real_root, real, normalized, flags)
-    except OSError as exc:
-        raise _os_error_to_http(exc, normalized) from exc
-    try:
-        st = os.fstat(fd)
-        if not stat_module.S_ISREG(st.st_mode):
-            raise HTTPError(HTTPStatus.FORBIDDEN, "forbidden", f"not a regular file: {normalized}")
-        return os.fdopen(fd, "rb", buffering=0), st
-    except BaseException:
-        os.close(fd)
-        raise
+def _origin_pattern(origin: str) -> re.Pattern:
+    """``https://*.example.com`` matches any subdomain; everything else matches exactly."""
+    origin = origin.rstrip("/").lower()
+    scheme, sep, host = origin.partition("://")
+    if not sep or not scheme or not host:
+        raise ValueError(f"not an origin (scheme://host[:port]): {origin!r}")
+    if host.startswith("*."):
+        return re.compile(re.escape(scheme) + r"://[a-z0-9-]+(\.[a-z0-9-]+)*" + re.escape(host[1:]))
+    return re.compile(re.escape(origin))
 
 
 class CFDSServer(ThreadingHTTPServer):
-    """Threaded HTTP server bound to one root directory."""
+    """Threaded HTTP server for one directory tree, or for many users."""
 
     daemon_threads = True
     request_queue_size = 128
@@ -326,17 +136,55 @@ class CFDSServer(ThreadingHTTPServer):
     def __init__(
         self,
         address: tuple[str, int],
-        root: str | os.PathLike,
+        root: str | os.PathLike | None = None,
         token: str | None = None,
         ssl_context: ssl.SSLContext | None = None,
         max_connections: int = DEFAULT_MAX_CONNECTIONS,
         allowed_hosts: tuple[str, ...] | list[str] = (),
+        *,
+        writable: bool = False,
+        auth=None,
+        users: UserStore | None = None,
+        datasets_root: str | os.PathLike | None = None,
+        datasets_writer_role: str | None = None,
+        public_url: str | None = None,
+        cors_origins: tuple[str, ...] | list[str] | None = None,
     ):
-        root = os.fspath(root)
-        if not os.path.isdir(root):
-            raise NotADirectoryError(f"root is not a directory: {root}")
-        self.real_root = os.path.realpath(root)
-        self.token = validate_token(token) if token else None
+        if auth is not None and token:
+            raise ValueError("give either a token or an auth object, not both")
+        self.auth = auth or (StaticTokenAuth(token) if token else NoAuth())
+        self.users = users
+        if users is None:
+            if root is None:
+                raise ValueError("a root directory is required")
+            root = os.fspath(root)
+            if not os.path.isdir(root):
+                raise NotADirectoryError(f"root is not a directory: {root}")
+            self.real_root = os.path.realpath(root)
+            self.writable = bool(writable)
+            self.datasets_root = None
+            self._single = Namespace(
+                [Mount("/", self.real_root, self.writable, "Served directory")]
+            )
+        else:
+            self.real_root = users.users_root
+            self.writable = True
+            self._single = None
+            self.datasets_root = None
+            if datasets_root is not None:
+                datasets_root = os.fspath(datasets_root)
+                if not os.path.isdir(datasets_root):
+                    raise NotADirectoryError(f"datasets root is not a directory: {datasets_root}")
+                self.datasets_root = os.path.realpath(datasets_root)
+                if is_within(self.datasets_root, self.real_root) or is_within(
+                    self.real_root, self.datasets_root
+                ):
+                    raise ValueError("the datasets root and the users root must not overlap")
+        self.datasets_writer_role = datasets_writer_role
+        self.public_url = public_url.rstrip("/") if public_url else None
+        if cors_origins is None:
+            cors_origins = DEFAULT_CORS_ORIGINS if self.auth.required else ()
+        self._cors = [_origin_pattern(origin) for origin in cors_origins]
         if max_connections < 1:
             raise ValueError("max_connections must be at least 1")
         self.max_connections = int(max_connections)
@@ -354,6 +202,47 @@ class CFDSServer(ThreadingHTTPServer):
                 self.socket, server_side=True, do_handshake_on_connect=False
             )
         self.uses_tls = ssl_context is not None
+
+    # -- configuration --------------------------------------------------------------
+
+    @property
+    def token(self) -> str | None:
+        """Kept for compatibility: whether a shared token is configured (not its value)."""
+        return "configured" if isinstance(self.auth, StaticTokenAuth) else None
+
+    @property
+    def read_only(self) -> bool:
+        return self.users is None and not self.writable
+
+    @property
+    def multi_user(self) -> bool:
+        return self.users is not None
+
+    def namespace_for(self, identity: Identity) -> Namespace:
+        if self._single is not None:
+            return self._single
+        mounts = []
+        if self.datasets_root is not None:
+            writer = self.datasets_writer_role is not None and (
+                self.datasets_writer_role in identity.roles
+            )
+            mounts.append(
+                Mount(
+                    DATASETS_MOUNT,
+                    self.datasets_root,
+                    writable=writer,
+                    description="Kaggle datasets (shared, read-only)",
+                )
+            )
+        home, quota = self.users.home(identity.sub, identity.email, identity.name)
+        mounts.append(Mount(HOME_MOUNT, home, True, "Your files", quota))
+        return Namespace(mounts)
+
+    def cors_allowed(self, origin: str | None) -> bool:
+        if not origin:
+            return False
+        origin = origin.strip().lower()
+        return any(pattern.fullmatch(origin) for pattern in self._cors)
 
     @staticmethod
     def _default_hosts() -> set[str]:
@@ -373,9 +262,9 @@ class CFDSServer(ThreadingHTTPServer):
         Such requests always carry the attacker's domain in ``Host``. IP addresses,
         single-label names, this machine's own names and names passed as
         ``allowed_hosts`` are accepted; other dotted names are not. Only enforced when
-        no token is configured, since a browser cannot supply the token.
+        callers do not authenticate, since a browser cannot supply a token by itself.
         """
-        if self.token is not None:
+        if self.auth.required:
             return True
         if not host_header:
             return True  # HTTP/1.0 clients; browsers always send Host
@@ -447,6 +336,8 @@ class CFDSServer(ThreadingHTTPServer):
                 connection.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+        if self.users is not None:
+            self.users.close()
 
 
 class CFDSRequestHandler(BaseHTTPRequestHandler):
@@ -461,6 +352,11 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
 
     server: CFDSServer
     _response_started = False
+    _cors_origin: str | None = None
+    _body_pending = False
+    _body_started = False
+    _body_iter = None
+    _continue_sent = False
 
     # -- plumbing ---------------------------------------------------------------
 
@@ -473,22 +369,27 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
         super().send_response(code, message)
 
     def end_headers(self):
+        if self._cors_origin:
+            self.send_header("Access-Control-Allow-Origin", self._cors_origin)
+            self.send_header("Access-Control-Expose-Headers", _CORS_EXPOSE_HEADERS)
+            self.send_header("Vary", "Origin")
         if self.close_connection:
             # Tell the client, so it does not try to reuse a connection we are closing.
             self.send_header("Connection", "close")
         super().end_headers()
 
     def handle_expect_100(self):
-        # Never invite a request body: nothing this server accepts has one.
+        # The go-ahead is sent later, by an upload, once its checks have passed.
         return True
 
     def send_error(self, code, message=None, explain=None):
         """Protocol-level errors raised by the base class, in the same JSON shape as ours."""
         self.close_connection = True
+        self._cors_origin = None
         if code == HTTPStatus.NOT_IMPLEMENTED:
             code, error_code = HTTPStatus.METHOD_NOT_ALLOWED, "method_not_allowed"
-            message = "this server is read-only; use GET or HEAD"
-            headers = {"Allow": "GET, HEAD"}
+            message = "unsupported method"
+            headers = {"Allow": self._allow_header(None)}
         else:
             error_code, headers = "bad_request", {}
         if not getattr(self, "command", None):
@@ -499,7 +400,7 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
             self.request_version = "HTTP/1.0"
         self._send_error_json(HTTPError(code, error_code, message or "bad request", headers))
 
-    def _send_json(self, status: int, payload: dict, headers: dict | None = None) -> None:
+    def _send_json(self, status: int, payload, headers: dict | None = None) -> None:
         body = json.dumps(payload).encode("ascii")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -512,31 +413,71 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def _send_empty(self, status: int, headers: dict | None = None) -> None:
+        self.send_response(status)
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        if status != HTTPStatus.NO_CONTENT:
+            self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _send_error_json(self, error: HTTPError) -> None:
+        headers = dict(error.headers)
+        if error.status == HTTPStatus.UNAUTHORIZED:
+            headers["WWW-Authenticate"] = self._www_authenticate(error)
         payload = {"error": {"code": error.code, "message": error.message}}
-        self._send_json(error.status, payload, error.headers)
+        self._send_json(error.status, payload, headers)
 
-    def _authorized(self) -> bool:
-        expected = self.server.token
-        if expected is None:
-            return True
-        scheme, _, supplied = self.headers.get("Authorization", "").partition(" ")
+    def _www_authenticate(self, error: HTTPError) -> str:
+        value = 'Bearer realm="cfds"'
+        bearer_error = getattr(error, "bearer_error", None)
+        if bearer_error:
+            value += f', error="{bearer_error}"'
+        if isinstance(self.server.auth, OIDCAuth):
+            value += f', resource_metadata="{self._public_url()}{PROTECTED_RESOURCE_PATH}"'
+        return value
+
+    def _public_url(self) -> str:
+        if self.server.public_url:
+            return self.server.public_url
+        host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.port}"
+        host = "".join(ch for ch in host if ch.isalnum() or ch in "-.:[]")
+        return f"{'https' if self.server.uses_tls else 'http'}://{host}"
+
+    def _bearer_token(self) -> str | None:
+        header = self.headers.get("Authorization")
+        if header is None:
+            return None
+        scheme, _, token = header.strip().partition(" ")
         if scheme.lower() != "bearer":
-            return False
-        # Header values arrive decoded as Latin-1; tokens are restricted to ASCII.
-        return hmac.compare_digest(
-            supplied.strip().encode("latin-1", "replace"), expected.encode("ascii")
-        )
+            return ""  # present but unusable: fails verification
+        return token.strip()
 
-    def _path_param(self, params: dict, default: str | None = None) -> str:
-        values = params.get("path")
+    def _param(self, params: dict, name: str, default: str | None = None) -> str:
+        values = params.get(name)
         if not values:
             if default is not None:
                 return default
-            raise HTTPError(HTTPStatus.BAD_REQUEST, "bad_request", "missing 'path' parameter")
+            raise HTTPError(HTTPStatus.BAD_REQUEST, "bad_request", f"missing '{name}' parameter")
         if len(values) > 1:
-            raise HTTPError(HTTPStatus.BAD_REQUEST, "bad_request", "'path' given more than once")
+            raise HTTPError(HTTPStatus.BAD_REQUEST, "bad_request", f"'{name}' given more than once")
         return values[0]
+
+    def _path_param(self, params: dict, default: str | None = None) -> str:
+        return self._param(params, "path", default)
+
+    def _flag(self, params: dict, name: str, default: bool) -> bool:
+        values = params.get(name)
+        if not values:
+            return default
+        value = values[-1].strip().lower()
+        if value in ("1", "true", "yes"):
+            return True
+        if value in ("0", "false", "no"):
+            return False
+        raise HTTPError(HTTPStatus.BAD_REQUEST, "bad_request", f"'{name}' must be 0 or 1")
+
+    # -- request bodies -----------------------------------------------------------
 
     def _has_request_body(self) -> bool:
         """True if a body might follow the headers, including when we cannot be sure."""
@@ -550,7 +491,7 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
         lengths = self.headers.get_all("Content-Length", [])
         if len(lengths) != 1 or not lengths[0].strip().isdigit():
             return
-        if "100-continue" in self.headers.get("Expect", "").lower():
+        if "100-continue" in self.headers.get("Expect", "").lower() and not self._continue_sent:
             return  # the client is waiting for a go-ahead and has not sent the body
         remaining = min(int(lengths[0]), MAX_DRAIN)
         try:
@@ -562,53 +503,116 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
+    def _discard_rest_of_body(self) -> None:
+        """After an upload failed part-way, read (a bounded amount of) what the client is
+        still sending, so that closing the connection does not reset it before our
+        error response has been read."""
+        if self._body_iter is None:
+            return
+        discarded = 0
+        try:
+            for chunk in self._body_iter:
+                discarded += len(chunk)
+                if discarded > MAX_DRAIN:
+                    break
+        except (HTTPError, OSError):
+            pass
+
+    def _send_continue(self) -> None:
+        """Answer ``Expect: 100-continue`` once an upload has passed its checks."""
+        if self._continue_sent or self.request_version < "HTTP/1.1":
+            return
+        if "100-continue" not in self.headers.get("Expect", "").lower():
+            return
+        self._continue_sent = True
+        self.wfile.write(b"HTTP/1.1 100 Continue\r\n\r\n")
+        self.wfile.flush()
+
+    def _request_body(self):
+        """Return ``(declared_length_or_None, chunk_iterator)`` for an upload."""
+        bad = HTTPError(HTTPStatus.BAD_REQUEST, "bad_request", "malformed request body framing")
+        if self.headers.defects:
+            raise bad
+        encodings = self.headers.get_all("Transfer-Encoding", [])
+        lengths = self.headers.get_all("Content-Length", [])
+        if encodings:
+            if lengths or len(encodings) > 1 or encodings[0].strip().lower() != "chunked":
+                raise bad
+            self._body_iter = self._chunked_body()
+            return None, self._body_iter
+        if not lengths:
+            self._body_pending = False
+            return 0, iter(())
+        if len(lengths) > 1 or not lengths[0].strip().isdigit():
+            raise bad
+        self._body_iter = self._fixed_body(int(lengths[0]))
+        return int(lengths[0]), self._body_iter
+
+    def _fixed_body(self, length: int):
+        self._body_started = True
+        remaining = length
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, CHUNK_SIZE))
+            if not chunk:
+                raise HTTPError(
+                    HTTPStatus.BAD_REQUEST, "bad_request", "the request body ended early"
+                )
+            remaining -= len(chunk)
+            yield chunk
+        self._body_pending = False
+
+    def _chunked_body(self):
+        bad = HTTPError(HTTPStatus.BAD_REQUEST, "bad_request", "malformed chunked request body")
+        self._body_started = True
+        while True:
+            line = self.rfile.readline(1026)
+            if not line.endswith(b"\n"):
+                raise bad
+            size_text = line.split(b";", 1)[0].strip()
+            if not _HEX.fullmatch(size_text):
+                raise bad
+            size = int(size_text, 16)
+            if size == 0:
+                for _ in range(64):  # trailer fields, ignored
+                    trailer = self.rfile.readline(8192)
+                    if trailer in (b"\r\n", b"\n"):
+                        self._body_pending = False
+                        return
+                    if not trailer.endswith(b"\n"):
+                        raise bad
+                raise bad
+            while size > 0:
+                chunk = self.rfile.read(min(size, CHUNK_SIZE))
+                if not chunk:
+                    raise bad
+                size -= len(chunk)
+                yield chunk
+            if self.rfile.readline(3) not in (b"\r\n", b"\n"):
+                raise bad
+
     # -- dispatch ---------------------------------------------------------------
 
     def do_GET(self):  # noqa: N802
         self._dispatch()
 
-    def do_HEAD(self):  # noqa: N802
-        self._dispatch()
+    do_HEAD = do_PUT = do_POST = do_DELETE = do_OPTIONS = do_PATCH = do_GET  # noqa: N815
 
-    def _reject_method(self):
-        self._response_started = False
-        self.close_connection = True
-        self._drain_request_body()
-        try:
-            self._send_error_json(
-                HTTPError(
-                    HTTPStatus.METHOD_NOT_ALLOWED,
-                    "method_not_allowed",
-                    "this server is read-only; use GET or HEAD",
-                    headers={"Allow": "GET, HEAD"},
-                )
-            )
-        except OSError:
-            pass
-
-    do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = _reject_method  # noqa: N815
+    def _allow_header(self, route: str | None) -> str:
+        methods = _ROUTES.get(route, _READ) if route else _READ
+        if self.server.read_only or route == PROTECTED_RESOURCE_PATH:
+            methods = [method for method in methods if method in _READ] or list(_READ)
+        return ", ".join(methods)
 
     def _dispatch(self) -> None:
         self._response_started = False
-        if self._has_request_body():
-            # We never read request bodies; do not let one be mistaken for a second
-            # request on a kept-alive connection.
-            self.close_connection = True
+        self._continue_sent = False
+        self._body_started = False
+        self._body_iter = None
+        self._body_pending = self._has_request_body()
+        origin = self.headers.get("Origin")
+        self._cors_origin = origin.strip() if self.server.cors_allowed(origin) else None
+        is_upload = False
         try:
-            if not self._authorized():
-                raise HTTPError(
-                    HTTPStatus.UNAUTHORIZED,
-                    "unauthorized",
-                    "a valid bearer token is required",
-                    headers={"WWW-Authenticate": 'Bearer realm="cfds"'},
-                )
-            if not self.server.host_allowed(self.headers.get("Host")):
-                raise HTTPError(
-                    HTTPStatus.MISDIRECTED_REQUEST,
-                    "host_not_allowed",
-                    "this host name is not allowed without a token; start cfds-server with "
-                    "--allowed-host <name>, or configure a token",
-                )
             try:
                 split = urlsplit(self.path)
                 params = parse_qs(
@@ -620,17 +624,45 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
                 )
             except ValueError as exc:
                 raise HTTPError(HTTPStatus.BAD_REQUEST, "bad_request", "bad request URL") from exc
-            route = split.path.rstrip("/")
-            if route == f"{API_PREFIX}/ls":
-                self._handle_ls(params)
-            elif route == f"{API_PREFIX}/file":
-                self._handle_file(params)
-            else:
+            route = split.path.rstrip("/") or "/"
+            if self.command == "OPTIONS":
+                self._handle_options(route)
+                return
+            if route not in _ROUTES:
+                self._authenticate()  # do not reveal anything to anonymous callers
                 raise HTTPError(HTTPStatus.NOT_FOUND, "not_found", "unknown endpoint")
+            allowed = self._allow_header(route).split(", ")
+            if self.command not in allowed:
+                raise HTTPError(
+                    HTTPStatus.METHOD_NOT_ALLOWED,
+                    "method_not_allowed",
+                    "this server is read-only; use GET or HEAD"
+                    if self.server.read_only
+                    else f"use {' or '.join(allowed)} for this endpoint",
+                    headers={"Allow": ", ".join(allowed)},
+                )
+            if route == PROTECTED_RESOURCE_PATH:
+                self._handle_protected_resource()
+                return
+            is_upload = self.command == "PUT"
+            if self._body_pending and not is_upload:
+                # Nothing else takes a body; do not let one be mistaken for a second
+                # request on a kept-alive connection.
+                self.close_connection = True
+            identity = self._authenticate()
+            namespace = self.server.namespace_for(identity)
+            handler = getattr(self, "_" + self.command.lower() + "_" + route.rsplit("/", 1)[1])
+            handler(namespace, params, identity)
         except HTTPError as error:
             if self._response_started:
                 self.close_connection = True
             else:
+                if self._body_pending:
+                    self.close_connection = True
+                    if not self._body_started:
+                        self._drain_request_body()
+                    else:
+                        self._discard_rest_of_body()
                 self._send_error_json(error)
         except (BrokenPipeError, ConnectionResetError, socket.timeout, ssl.SSLError):
             self.close_connection = True
@@ -643,22 +675,131 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
                         HTTPStatus.INTERNAL_SERVER_ERROR, "internal_error", "internal server error"
                     )
                 )
+        finally:
+            if self._body_pending:
+                self.close_connection = True
 
-    # -- endpoints --------------------------------------------------------------
+    def _authenticate(self) -> Identity:
+        identity = self.server.auth.authenticate(self._bearer_token())
+        if not self.server.host_allowed(self.headers.get("Host")):
+            raise HTTPError(
+                HTTPStatus.MISDIRECTED_REQUEST,
+                "host_not_allowed",
+                "this host name is not allowed without a token; start cfds-server with "
+                "--allowed-host <name>, or configure a token",
+            )
+        return identity
 
-    def _handle_ls(self, params: dict) -> None:
+    def _handle_options(self, route: str) -> None:
+        if route not in _ROUTES:
+            raise HTTPError(HTTPStatus.NOT_FOUND, "not_found", "unknown endpoint")
+        allow = self._allow_header(route)
+        headers = {"Allow": allow}
+        if self._cors_origin and self.headers.get("Access-Control-Request-Method"):
+            headers.update(
+                {
+                    "Access-Control-Allow-Methods": allow,
+                    "Access-Control-Allow-Headers": _CORS_ALLOW_HEADERS,
+                    "Access-Control-Max-Age": "600",
+                }
+            )
+        self._send_empty(HTTPStatus.NO_CONTENT, headers)
+
+    def _handle_protected_resource(self) -> None:
+        auth = self.server.auth
+        if not isinstance(auth, OIDCAuth):
+            raise HTTPError(HTTPStatus.NOT_FOUND, "not_found", "this server does not use OAuth")
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "resource": self._public_url(),
+                "authorization_servers": [auth.issuer],
+                "scopes_supported": ["openid", "profile", "email"],
+                "bearer_methods_supported": ["header"],
+                "resource_name": "cfds storage",
+            },
+        )
+
+    # -- helpers for endpoints ------------------------------------------------------
+
+    @staticmethod
+    def _locate_for_write(namespace: Namespace, path: str):
+        """Like ``namespace.locate`` but every refusal is a ``read_only``."""
+        try:
+            mount, inner, normalized = namespace.locate(path)
+        except HTTPError as exc:
+            if exc.code == "not_found" and namespace.virtual_root:
+                raise read_only(_fsops.normalize_path(path)) from exc
+            raise
+        if mount is None or not mount.writable:
+            raise read_only(normalized)
+        return mount, inner, normalized
+
+    @staticmethod
+    def _not_mount_root(mount: Mount, inner: str, normalized: str) -> None:
+        if inner == "/":
+            raise read_only(normalized)
+
+    # -- reading ----------------------------------------------------------------
+
+    def _get_ls(self, namespace: Namespace, params: dict, identity: Identity) -> None:
         path = self._path_param(params, default="/")
         list_entries = params.get("list", ["1"])[-1] not in ("0", "false", "no")
-        self._send_json(HTTPStatus.OK, describe(self.server.real_root, path, list_entries))
+        mount, inner, _ = namespace.locate(path)
+        if mount is None:
+            payload = namespace.describe_root(list_entries)
+        else:
+            payload = describe(
+                mount.real_root, inner, list_entries, prefix=mount.path, writable=mount.writable
+            )
+        self._send_json(HTTPStatus.OK, payload)
 
-    def _handle_file(self, params: dict) -> None:
+    _head_ls = _get_ls
+
+    def _get_me(self, namespace: Namespace, params: dict, identity: Identity) -> None:
+        user = identity.public()
+        auth = self.server.auth
+        if isinstance(auth, OIDCAuth) and user["email"] is None and user["name"] is None:
+            try:  # access tokens often carry no profile; the userinfo endpoint does
+                claims = auth.userinfo(self._bearer_token() or "") or {}
+            except HTTPError:
+                claims = {}
+            user["email"] = claims.get("email") if isinstance(claims.get("email"), str) else None
+            name = claims.get("name") or claims.get("preferred_username")
+            user["name"] = name if isinstance(name, str) else None
+        home = next((m for m in namespace.mounts if m.path == HOME_MOUNT), None)
+        if not namespace.virtual_root:
+            home = namespace.mounts[0] if namespace.mounts[0].writable else None
+        datasets = next((m for m in namespace.mounts if m.path == DATASETS_MOUNT), None)
+        quota = home.quota.snapshot() if home is not None and home.quota is not None else None
+        default_path = (datasets or home or namespace.mounts[0]).path
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                "user": user,
+                "quota": quota,
+                "home": home.path if home is not None else None,
+                "datasets": datasets.path if datasets is not None else None,
+                "default_path": default_path,
+                "mounts": [mount.public() for mount in namespace.mounts],
+            },
+        )
+
+    _head_me = _get_me
+
+    def _get_file(self, namespace: Namespace, params: dict, identity: Identity) -> None:
         path = self._path_param(params)
-        handle, st = open_regular_file(self.server.real_root, path)
+        mount, inner, normalized = namespace.locate(path)
+        if mount is None:
+            raise HTTPError(
+                HTTPStatus.BAD_REQUEST, "is_a_directory", f"is a directory: {normalized}"
+            )
+        handle, st = open_regular_file(mount.real_root, inner)
         with handle:
             size = st.st_size
             etag = make_etag(st)
             if_match = self.headers.get("If-Match")
-            if if_match is not None and not _etag_matches(if_match, etag):
+            if if_match is not None and not _fsops.etag_matches(if_match, etag):
                 raise HTTPError(
                     HTTPStatus.PRECONDITION_FAILED,
                     "precondition_failed",
@@ -708,9 +849,144 @@ class CFDSRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 remaining -= len(chunk)
 
+    _head_file = _get_file
+
+    # -- writing ----------------------------------------------------------------
+
+    def _put_file(self, namespace: Namespace, params: dict, identity: Identity) -> None:
+        path = self._path_param(params)
+        mount, inner, normalized = self._locate_for_write(namespace, path)
+        self._not_mount_root(mount, inner, normalized)
+        overwrite = self._flag(params, "overwrite", True)
+        create = self._flag(params, "create", True)
+        length, chunks = self._request_body()
+        info, created = write_file(
+            mount.real_root,
+            inner,
+            chunks,
+            length=length,
+            overwrite=overwrite,
+            create=create,
+            if_match=self.headers.get("If-Match"),
+            if_none_match=self.headers.get("If-None-Match"),
+            quota=mount.quota,
+            display_prefix=mount.path,
+            before_body=self._send_continue,
+        )
+        status = HTTPStatus.CREATED if created else HTTPStatus.OK
+        self._send_json(status, info, {"ETag": info["etag"]})
+
+    def _delete_file(self, namespace: Namespace, params: dict, identity: Identity) -> None:
+        path = self._path_param(params)
+        mount, inner, normalized = self._locate_for_write(namespace, path)
+        self._not_mount_root(mount, inner, normalized)
+        freed = delete_path(
+            mount.real_root,
+            inner,
+            recursive=self._flag(params, "recursive", False),
+            if_match=self.headers.get("If-Match"),
+        )
+        if mount.quota is not None:
+            mount.quota.adjust(-freed)
+        self._send_empty(HTTPStatus.NO_CONTENT)
+
+    def _post_mkdir(self, namespace: Namespace, params: dict, identity: Identity) -> None:
+        path = self._path_param(params)
+        parents = self._flag(params, "parents", False)
+        normalized = _fsops.normalize_path(path)
+        if normalized == "/" or normalized in (mount.path for mount in namespace.mounts):
+            if not parents:
+                raise HTTPError(HTTPStatus.CONFLICT, "exists", f"already exists: {normalized}")
+            mount, inner, _ = namespace.locate(normalized)
+            if mount is None:
+                info = namespace.describe_root(False)["info"]
+            else:
+                info = describe(
+                    mount.real_root, inner, False, prefix=mount.path, writable=mount.writable
+                )["info"]
+            self._send_json(HTTPStatus.OK, info)
+            return
+        mount, inner, normalized = self._locate_for_write(namespace, path)
+        info, created = make_directory(
+            mount.real_root, inner, parents=parents, display_prefix=mount.path
+        )
+        self._send_json(HTTPStatus.CREATED if created else HTTPStatus.OK, info)
+
+    def _post_mv(self, namespace: Namespace, params: dict, identity: Identity) -> None:
+        src, dst = self._param(params, "src"), self._param(params, "dst")
+        overwrite = self._flag(params, "overwrite", False)
+        src_mount, src_inner, src_norm = namespace.locate(src)
+        try:
+            dst_mount, dst_inner, dst_norm = namespace.locate(dst)
+        except HTTPError as exc:
+            if exc.code != "not_found":
+                raise
+            dst_mount, dst_inner, dst_norm = None, "/", _fsops.normalize_path(dst)
+        if src_mount is not None and dst_mount is not None and src_mount is not dst_mount:
+            raise HTTPError(
+                HTTPStatus.BAD_REQUEST,
+                "cross_mount",
+                f"cannot move between {src_mount.path} and {dst_mount.path}; copy instead",
+            )
+        for mount, inner, normalized in (
+            (src_mount, src_inner, src_norm),
+            (dst_mount, dst_inner, dst_norm),
+        ):
+            if mount is None or not mount.writable:
+                raise read_only(normalized)
+            self._not_mount_root(mount, inner, normalized)
+        info, freed = move_path(
+            src_mount.real_root,
+            src_inner,
+            dst_inner,
+            overwrite=overwrite,
+            display_prefix=src_mount.path,
+        )
+        if src_mount.quota is not None:
+            src_mount.quota.adjust(-freed)
+        self._send_json(HTTPStatus.OK, info)
+
+    def _post_cp(self, namespace: Namespace, params: dict, identity: Identity) -> None:
+        src, dst = self._param(params, "src"), self._param(params, "dst")
+        overwrite = self._flag(params, "overwrite", False)
+        src_mount, src_inner, src_norm = namespace.locate(src)
+        if src_mount is None:
+            raise HTTPError(HTTPStatus.BAD_REQUEST, "is_a_directory", f"is a directory: {src_norm}")
+        dst_mount, dst_inner, dst_norm = self._locate_for_write(namespace, dst)
+        self._not_mount_root(dst_mount, dst_inner, dst_norm)
+        handle, st = open_regular_file(src_mount.real_root, src_inner)
+        etag = make_etag(st)
+
+        def chunks():
+            while True:
+                chunk = handle.read(CHUNK_SIZE)
+                if make_etag(os.fstat(handle.fileno())) != etag:
+                    raise HTTPError(
+                        HTTPStatus.CONFLICT,
+                        "source_changed",
+                        f"{src_norm} changed while it was being copied",
+                    )
+                if not chunk:
+                    return
+                yield chunk
+
+        with handle:
+            info, created = write_file(
+                dst_mount.real_root,
+                dst_inner,
+                chunks(),
+                length=st.st_size,
+                overwrite=overwrite,
+                quota=dst_mount.quota,
+                display_prefix=dst_mount.path,
+            )
+        self._send_json(
+            HTTPStatus.CREATED if created else HTTPStatus.OK, info, {"ETag": info["etag"]}
+        )
+
 
 def make_server(
-    root: str | os.PathLike = DEFAULT_ROOT,
+    root: str | os.PathLike | None = DEFAULT_ROOT,
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT,
     token: str | None = None,
@@ -718,8 +994,22 @@ def make_server(
     keyfile: str | None = None,
     max_connections: int = DEFAULT_MAX_CONNECTIONS,
     allowed_hosts: tuple[str, ...] | list[str] = (),
+    *,
+    writable: bool = False,
+    auth=None,
+    users_root: str | os.PathLike | None = None,
+    datasets_root: str | os.PathLike | None = None,
+    default_quota: int = DEFAULT_QUOTA,
+    datasets_writer_role: str | None = None,
+    public_url: str | None = None,
+    cors_origins: tuple[str, ...] | list[str] | None = None,
 ) -> CFDSServer:
-    """Create (but do not start) a server. Call ``serve_forever()`` on the result."""
+    """Create (but do not start) a server. Call ``serve_forever()`` on the result.
+
+    With ``users_root`` the server is multi-user: ``root`` is ignored, every caller
+    gets ``/home`` below ``users_root`` and, if given, ``datasets_root`` read-only at
+    ``/kaggle-datasets``.
+    """
     ssl_context = None
     if certfile:
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -727,14 +1017,27 @@ def make_server(
         ssl_context.load_cert_chain(certfile, keyfile)
     elif keyfile:
         raise ValueError("keyfile was given without certfile")
-    return CFDSServer(
-        (host, port),
-        root,
-        token=token,
-        ssl_context=ssl_context,
-        max_connections=max_connections,
-        allowed_hosts=allowed_hosts,
-    )
+    users = UserStore(users_root, default_quota) if users_root is not None else None
+    try:
+        return CFDSServer(
+            (host, port),
+            None if users is not None else root,
+            token=token,
+            ssl_context=ssl_context,
+            max_connections=max_connections,
+            allowed_hosts=allowed_hosts,
+            writable=writable,
+            auth=auth,
+            users=users,
+            datasets_root=datasets_root,
+            datasets_writer_role=datasets_writer_role,
+            public_url=public_url,
+            cors_origins=cors_origins,
+        )
+    except BaseException:
+        if users is not None:
+            users.close()
+        raise
 
 
 def _is_loopback(host: str) -> bool:
@@ -771,6 +1074,17 @@ def _positive(value: str) -> int:
     return number
 
 
+_SIZE_UNITS = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+
+
+def _size(value: str) -> int:
+    """``107374182400``, ``100G`` or ``100GiB`` -> bytes (binary units)."""
+    match = re.fullmatch(r"\s*(\d+)\s*([KMGT]?)(?:i?B)?\s*", value, re.IGNORECASE)
+    if match is None:
+        raise argparse.ArgumentTypeError(f"not a size like 100G: {value!r}")
+    return int(match.group(1)) * _SIZE_UNITS[match.group(2).upper()]
+
+
 def _ensure_descriptors(max_connections: int) -> None:
     """Raise the open-file limit if the connection cap would not fit under it."""
     try:
@@ -798,26 +1112,75 @@ def _ensure_descriptors(max_connections: int) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cfds-server",
-        description="Serve a directory read-only for the cfds:// fsspec filesystem.",
+        description="Serve a directory (or per-user spaces) for the cfds:// fsspec filesystem.",
     )
-    parser.add_argument(
+    single = parser.add_argument_group("single tree")
+    single.add_argument(
         "--root",
         default=os.environ.get("CFDS_ROOT", DEFAULT_ROOT),
-        help="directory to serve (default: $CFDS_ROOT or %(default)s)",
+        help="directory to serve at / (default: $CFDS_ROOT or %(default)s)",
     )
-    parser.add_argument(
+    single.add_argument(
+        "--writable", action="store_true", help="allow uploads, deletes and renames under --root"
+    )
+    multi = parser.add_argument_group("multi-user")
+    multi.add_argument(
+        "--users-root",
+        default=os.environ.get("CFDS_USERS_ROOT"),
+        help="directory holding one private folder per user; enables multi-user mode "
+        "(each user sees /home and /kaggle-datasets; --root is ignored)",
+    )
+    multi.add_argument(
+        "--datasets-root",
+        default=os.environ.get("CFDS_DATASETS_ROOT", DEFAULT_DATASETS_ROOT),
+        help="shared read-only datasets shown at /kaggle-datasets (default: %(default)s)",
+    )
+    multi.add_argument(
+        "--default-quota",
+        type=_size,
+        default=DEFAULT_QUOTA,
+        help="storage per user, e.g. 100G (default: 100G)",
+    )
+    multi.add_argument(
+        "--datasets-writer-role",
+        metavar="ROLE",
+        help="users with this role (from the token's 'roles' claim) may write to /kaggle-datasets",
+    )
+    auth = parser.add_argument_group("authentication")
+    auth.add_argument(
+        "--oidc-issuer",
+        default=os.environ.get("CFDS_OIDC_ISSUER"),
+        metavar="URL",
+        help="require access tokens from this OpenID Connect provider "
+        "(e.g. https://oidc.cloudfronts.group)",
+    )
+    auth.add_argument(
+        "--audience",
+        action="append",
+        metavar="CLIENT_ID",
+        help="accepted token audience (repeatable; default: " + ", ".join(DEFAULT_AUDIENCES) + ")",
+    )
+    auth.add_argument(
+        "--token-file",
+        help="file holding a shared bearer token clients must send (or set $CFDS_TOKEN)",
+    )
+    auth.add_argument(
+        "--public-url",
+        default=os.environ.get("CFDS_PUBLIC_URL"),
+        metavar="URL",
+        help="the address clients use, e.g. https://storage.cloudfronts.group "
+        "(used in OAuth metadata; default: taken from each request)",
+    )
+    net = parser.add_argument_group("network")
+    net.add_argument(
         "--host",
         default=DEFAULT_HOST,
         help="address to bind; use 0.0.0.0 to accept remote clients (default: %(default)s)",
     )
-    parser.add_argument("--port", type=_port, default=DEFAULT_PORT, help="default: %(default)s")
-    parser.add_argument(
-        "--token-file",
-        help="file holding the bearer token clients must send (or set $CFDS_TOKEN)",
-    )
-    parser.add_argument("--certfile", help="TLS certificate (PEM); enables HTTPS")
-    parser.add_argument("--keyfile", help="TLS private key (PEM), if not in --certfile")
-    parser.add_argument(
+    net.add_argument("--port", type=_port, default=DEFAULT_PORT, help="default: %(default)s")
+    net.add_argument("--certfile", help="TLS certificate (PEM); enables HTTPS")
+    net.add_argument("--keyfile", help="TLS private key (PEM), if not in --certfile")
+    net.add_argument(
         "--allowed-host",
         action="append",
         default=[],
@@ -825,7 +1188,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="extra DNS name clients may use for this server when no token is set "
         "(repeatable; IP addresses and single-label names are always allowed)",
     )
-    parser.add_argument(
+    net.add_argument(
+        "--cors-origin",
+        action="append",
+        metavar="ORIGIN",
+        help="browser origin allowed to call the API, e.g. https://vscode.dev or "
+        "https://*.vscode-cdn.net (repeatable; default with sign-in: "
+        + ", ".join(DEFAULT_CORS_ORIGINS)
+        + "; default without: none)",
+    )
+    net.add_argument(
         "--max-connections",
         type=_positive,
         default=DEFAULT_MAX_CONNECTIONS,
@@ -849,6 +1221,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     try:
         token = _read_token(args)
+        auth = None
+        if args.oidc_issuer:
+            if token:
+                raise ValueError("use either --oidc-issuer or a shared token, not both")
+            audiences = tuple(args.audience) if args.audience else DEFAULT_AUDIENCES
+            auth = OIDCAuth(args.oidc_issuer, audiences)
+        datasets_root = None
+        if args.users_root and args.datasets_root:
+            if os.path.isdir(args.datasets_root):
+                datasets_root = args.datasets_root
+            else:
+                logger.warning("datasets root %s does not exist; not shown", args.datasets_root)
         server = make_server(
             args.root,
             args.host,
@@ -858,23 +1242,43 @@ def main(argv: list[str] | None = None) -> int:
             args.keyfile,
             max_connections=args.max_connections,
             allowed_hosts=args.allowed_host,
+            writable=args.writable,
+            auth=auth,
+            users_root=args.users_root or None,
+            datasets_root=datasets_root,
+            default_quota=args.default_quota,
+            datasets_writer_role=args.datasets_writer_role,
+            public_url=args.public_url,
+            cors_origins=args.cors_origin,
         )
-    except (OSError, ValueError, OverflowError, ssl.SSLError) as exc:
+    except (OSError, ValueError, OverflowError, RuntimeError, ssl.SSLError) as exc:
         print(f"cfds-server: {exc}", file=sys.stderr)
         return 2
     _ensure_descriptors(server.max_connections)
-    if token is None and not _is_loopback(args.host):
+    if not server.auth.required and not _is_loopback(args.host):
         logger.warning(
-            "no token configured: anyone who can reach %s:%s can read %s",
+            "no authentication: anyone who can reach %s:%s can %s %s",
             args.host,
             server.port,
+            "read" if server.read_only else "read and change",
             server.real_root,
         )
-    if token is not None and not server.uses_tls:
-        logger.warning("token auth without TLS: the token and data travel unencrypted")
+    if server.auth.required and not server.uses_tls:
+        logger.warning(
+            "tokens are accepted without TLS here: put a TLS proxy in front, or use --certfile"
+        )
+    if server.multi_user:
+        logger.info(
+            "multi-user mode: homes under %s (%d bytes each), datasets %s, sign-in: %s",
+            server.real_root,
+            server.users.default_quota,
+            server.datasets_root or "(none)",
+            server.auth.description,
+        )
     logger.info(
-        "serving %s read-only on %s://%s:%s",
+        "serving %s %s on %s://%s:%s",
         server.real_root,
+        "read-only" if server.read_only else "read-write",
         "https" if server.uses_tls else "http",
         args.host,
         server.port,

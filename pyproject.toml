@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cf-datascience-fs"
 dynamic = ["version"]
-description = "Read-only fsspec filesystem (cfds://) for browsing and reading a remote storage drive over HTTP."
+description = "fsspec filesystem (cfds://) for reading and writing a remote storage drive over HTTP, with OIDC sign-in."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
@@ -18,13 +18,19 @@ classifiers = [
     "Topic :: System :: Filesystems",
 ]
 dependencies = [
+    "aiohttp>=3.8",
     "fsspec>=2024.2.0",
     "requests>=2.25",
     "urllib3>=1.26",
 ]
 
 [project.optional-dependencies]
+# Needed by cfds-server only with --oidc-issuer (token signature checks).
+server = [
+    "PyJWT[crypto]>=2.8",
+]
 test = [
+    "cf-datascience-fs[server]",
     "pytest>=7.3",
     "pandas",
     "pyarrow",
@@ -38,12 +44,13 @@ dev = [
 Repository = "https://github.com/sweeden-ttu/cf-datascience-fs"
 
 [project.scripts]
+cfds = "cf_datascience_fs.cli:main"
 cfds-server = "cf_datascience_fs.server:main"
 
 # Makes fsspec.open("cfds://host:port/path") work without an explicit import.
 [project.entry-points."fsspec.specs"]
-cfds = "cf_datascience_fs.core:CFDataScienceFileSystem"
-cfdss = "cf_datascience_fs.core:CFDataScienceFileSystem"
+cfds = "cf_datascience_fs.asyn:CFDataScienceAsyncFileSystem"
+cfdss = "cf_datascience_fs.asyn:CFDataScienceAsyncFileSystem"
 
 [tool.hatch.version]
 path = "src/cf_datascience_fs/_version.py"

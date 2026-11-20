@@ -16,7 +16,7 @@ from urllib.parse import quote
 import pytest
 from conftest import bump_mtime, can_symlink, start_server, stop_server
 
-from cf_datascience_fs import CFDataScienceFileSystem
+from cf_datascience_fs import CFDataScienceFileSystem, _fsops
 from cf_datascience_fs import server as server_module
 from cf_datascience_fs.server import (
     HTTPError,
@@ -586,11 +586,11 @@ def test_directory_swapped_for_symlink_after_the_check_is_not_followed(
     """The path check and the open are separate steps; the open must not trust the check."""
     if not can_symlink(tmp_path):
         pytest.skip("symlinks are not available")
-    if not server_module._DIR_FD_OPEN:
+    if not _fsops._DIR_FD_OPEN:
         pytest.skip("needs descriptor-relative open")
     root, stale = swap_for_outside_link(drive, outside)
     # Pretend the check ran before the swap, by handing back the pre-swap answer.
-    monkeypatch.setattr(server_module, "resolve_path", lambda _root, path: stale[path])
+    monkeypatch.setattr(_fsops, "resolve_path", lambda _root, path: stale[path])
 
     for list_entries in (True, False):
         with pytest.raises(HTTPError) as excinfo:

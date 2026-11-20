@@ -6,7 +6,7 @@ import threading
 
 import pytest
 
-from cf_datascience_fs import CFDataScienceFileSystem
+from cf_datascience_fs import CFDataScienceAsyncFileSystem, CFDataScienceFileSystem
 from cf_datascience_fs.server import make_server
 
 BIG_SIZE = 5 * 1024 * 1024 + 123
@@ -23,9 +23,10 @@ def _direct_loopback(monkeypatch, tmp_path_factory):
     netrc.write_text("")
     monkeypatch.setenv("NETRC", str(netrc))
     yield
-    for instance in list(CFDataScienceFileSystem._cache.values()):
-        instance.close()
-    CFDataScienceFileSystem.clear_instance_cache()
+    for cls in (CFDataScienceFileSystem, CFDataScienceAsyncFileSystem):
+        for instance in list(cls._cache.values()):
+            instance.close()
+        cls.clear_instance_cache()
 
 
 def _deterministic_bytes(size: int) -> bytes:
@@ -77,11 +78,12 @@ def server(drive):
     stop_server(server, thread)
 
 
-@pytest.fixture
-def fs(server):
-    filesystem = CFDataScienceFileSystem(
-        host="127.0.0.1", port=server.port, retries=0, skip_instance_cache=True
-    )
+@pytest.fixture(params=["sync", "async"])
+def fs(request, server):
+    """Both clients: the read-only one built on requests, and the registered async one
+    (used here through fsspec's synchronous wrappers)."""
+    cls = CFDataScienceFileSystem if request.param == "sync" else CFDataScienceAsyncFileSystem
+    filesystem = cls(host="127.0.0.1", port=server.port, retries=0, skip_instance_cache=True)
     yield filesystem
     filesystem.close()
 

@@ -1,4 +1,7 @@
-"""fsspec client for :mod:`cf_datascience_fs.server`.
+"""Read-only fsspec client for :mod:`cf_datascience_fs.server`, built on ``requests``.
+
+This is the original client. :class:`cf_datascience_fs.asyn.CFDataScienceAsyncFileSystem`
+(registered for ``cfds://``) reads *and* writes, and works from async code too.
 
 The filesystem is read-only. Paths are absolute within the served root, so
 ``/datasets/train.csv`` here is ``/mnt/TMP/datasets/train.csv`` on the server when the
@@ -22,6 +25,7 @@ from fsspec.utils import isfilelike, stringify_path
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from ._errors import FileChangedError
 from ._version import __version__
 
 DEFAULT_PORT = 8765
@@ -48,10 +52,6 @@ def _split_url(path: str) -> tuple[str | None, str | None, str]:
 
 def _read_only(path: str | None = None) -> OSError:
     return OSError(errno.EROFS, "cfds is a read-only file system", path)
-
-
-class FileChangedError(OSError):
-    """The remote file was modified after it was opened or stat-ed."""
 
 
 class _RangeNotSatisfiable(OSError):

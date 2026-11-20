@@ -13,16 +13,22 @@ import fsspec
 import pytest
 from conftest import bump_mtime, can_symlink, start_server, stop_server
 from fsspec.callbacks import Callback
+from fsspec.spec import AbstractBufferedFile
 
-from cf_datascience_fs import CFDataScienceFile, CFDataScienceFileSystem, FileChangedError
+from cf_datascience_fs import (
+    CFDataScienceAsyncFileSystem,
+    CFDataScienceFileSystem,
+    FileChangedError,
+)
 
 # -- registration and URL handling ----------------------------------------------------
 
 
 @pytest.mark.parametrize("protocol", ["cfds", "cfdss"])
 def test_registered_with_fsspec(protocol):
-    # Resolved through the "fsspec.specs" entry point declared in pyproject.toml.
-    assert fsspec.get_filesystem_class(protocol) is CFDataScienceFileSystem
+    # Resolved through the "fsspec.specs" entry point declared in pyproject.toml. The
+    # read-write async client is registered; this read-only one is used directly.
+    assert fsspec.get_filesystem_class(protocol) is CFDataScienceAsyncFileSystem
 
 
 @pytest.mark.parametrize(
@@ -74,7 +80,7 @@ def test_base_url_and_unstrip_protocol():
 
 def test_url_to_fs(server):
     fs, path = fsspec.core.url_to_fs(f"cfds://127.0.0.1:{server.port}/datasets/train.csv")
-    assert isinstance(fs, CFDataScienceFileSystem)
+    assert isinstance(fs, CFDataScienceAsyncFileSystem)
     assert (fs.host, fs.port, path) == ("127.0.0.1", server.port, "/datasets/train.csv")
     assert fs.isfile(path)
 
@@ -195,7 +201,7 @@ def test_cat_ranges(fs, big_bytes):
 
 def test_open_read_seek_tell(fs):
     with fs.open("/datasets/nested/deep.txt", "rb") as handle:
-        assert isinstance(handle, CFDataScienceFile)
+        assert isinstance(handle, AbstractBufferedFile)
         assert handle.size == 10
         assert handle.readable() and handle.seekable() and not handle.writable()
         assert handle.read(3) == b"012"
@@ -350,6 +356,8 @@ def test_get_missing_raises(fs, tmp_path):
 
 
 def test_every_write_operation_is_refused(fs, drive, tmp_path):
+    if isinstance(fs, CFDataScienceAsyncFileSystem):
+        pytest.skip("the read-write client is tested against a read-only server in test_asyn.py")
     local = tmp_path / "local.txt"
     local.write_text("local")
     operations = [
@@ -498,7 +506,7 @@ def test_listings_cache_is_opt_in(server, drive):
 def test_pickle_round_trip(fs):
     assert fs.cat_file("/hello.txt") == b"hello world\n"  # creates the HTTP session
     clone = pickle.loads(pickle.dumps(fs))
-    assert isinstance(clone, CFDataScienceFileSystem)
+    assert type(clone) is type(fs)
     assert (clone.host, clone.port) == (fs.host, fs.port)
     assert clone.cat_file("/hello.txt") == b"hello world\n"
 
@@ -598,13 +606,13 @@ def test_netrc_does_not_replace_the_token(drive, tmp_path, monkeypatch):
     monkeypatch.setenv("NETRC", str(netrc))
     seen = []
     server, thread = start_server(drive, token="s3cret-token")
-    original = server.RequestHandlerClass._authorized
+    original = server.RequestHandlerClass._authenticate
 
     def spy(handler):
         seen.append(handler.headers.get("Authorization"))
         return original(handler)
 
-    monkeypatch.setattr(server.RequestHandlerClass, "_authorized", spy)
+    monkeypatch.setattr(server.RequestHandlerClass, "_authenticate", spy)
     try:
         common = {"host": "127.0.0.1", "port": server.port, "retries": 0}
         with_token = CFDataScienceFileSystem(
