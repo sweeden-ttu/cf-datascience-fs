@@ -28,7 +28,7 @@ public struct CFDSConfiguration: Sendable, Equatable {
     public static let production = CFDSConfiguration(
         issuer: URL(string: "https://oidc.cloudfronts.group")!,
         clientID: "cfds-ios",
-        redirectURI: URL(string: "com.cloudfronts.datascientist:/oauth2/callback")!,
+        redirectURI: URL(string: "groups.cloudfronts.datascientist:/oauth2/callback")!,
         apiBaseURL: URL(string: "https://storage.cloudfronts.group")!,
         signupWebURL: URL(string: "https://datascientist.cloudfronts.group")!,
         scopes: ["openid", "profile", "email"],

@@ -36,7 +36,7 @@ final class AuthorizationRequestTests: XCTestCase {
         let q = query(request.url)
         XCTAssertEqual(q["response_type"], "code")
         XCTAssertEqual(q["client_id"], "cfds-ios")
-        XCTAssertEqual(q["redirect_uri"], "com.cloudfronts.datascientist:/oauth2/callback")
+        XCTAssertEqual(q["redirect_uri"], "groups.cloudfronts.datascientist:/oauth2/callback")
         XCTAssertEqual(q["scope"], "openid profile email")
         XCTAssertEqual(q["code_challenge"], request.pkce.challenge)
         XCTAssertEqual(q["code_challenge_method"], "S256")
@@ -54,14 +54,14 @@ final class AuthorizationRequestTests: XCTestCase {
         let request = AuthorizationRequest(
             discovery: discovery, config: .production, createAccount: false)
         let good = URL(
-            string: "com.cloudfronts.datascientist:/oauth2/callback?code=abc&state=\(request.state)")!
+            string: "groups.cloudfronts.datascientist:/oauth2/callback?code=abc&state=\(request.state)")!
         XCTAssertEqual(try request.code(fromCallback: good), "abc")
 
-        let forged = URL(string: "com.cloudfronts.datascientist:/oauth2/callback?code=abc&state=x")!
+        let forged = URL(string: "groups.cloudfronts.datascientist:/oauth2/callback?code=abc&state=x")!
         XCTAssertThrowsError(try request.code(fromCallback: forged))
 
         let denied = URL(
-            string: "com.cloudfronts.datascientist:/oauth2/callback?error=access_denied")!
+            string: "groups.cloudfronts.datascientist:/oauth2/callback?error=access_denied")!
         XCTAssertThrowsError(try request.code(fromCallback: denied)) { error in
             XCTAssertEqual(error as? CFDSError, .cancelled)
         }

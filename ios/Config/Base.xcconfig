@@ -11,7 +11,7 @@ CFDS_KEYCHAIN_GROUP = com.cloudfronts.datascientist.shared
 // OIDC provider and the public client registered for this app (PKCE, no secret).
 CFDS_ISSUER = https:/$()/oidc.cloudfronts.group
 CFDS_CLIENT_ID = cfds-ios
-CFDS_REDIRECT_URI = com.cloudfronts.datascientist:/oauth2/callback
+CFDS_REDIRECT_URI = groups.cloudfronts.datascientist:/oauth2/callback
 CFDS_SCOPES = openid profile email
 
 // The cfds storage server and the public sign-up site.

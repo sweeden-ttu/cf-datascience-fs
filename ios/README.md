@@ -64,7 +64,7 @@ Register a **public** client (no secret, PKCE S256 required):
 | Setting | Value |
 | --- | --- |
 | client_id | `cfds-ios` |
-| Redirect URI | `com.cloudfronts.datascientist:/oauth2/callback` |
+| Redirect URI | `groups.cloudfronts.datascientist:/oauth2/callback` |
 | Scopes | `openid profile email` |
 | Grant types | `authorization_code` (plus `refresh_token` if you want users to stay signed in) |
 
