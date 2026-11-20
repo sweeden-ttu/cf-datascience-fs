@@ -239,6 +239,7 @@ public final class CFDSClient: Sendable {
         case (_, "parent_not_found"): return .parentNotFound(path)
         case (_, "cross_mount"): return .crossMount(path)
         case (_, "not_empty"): return .directoryNotEmpty(path)
+        case (_, "source_changed"): return .changedOnServer(path)
         case (403, _): return .forbidden(path)
         case (404, _): return .notFound(path)
         case (409, _): return .alreadyExists(path)

@@ -162,6 +162,11 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(CFDSClient.error(status: 404, body: body("parent_not_found"), path: "/h"), .parentNotFound("/h"))
         XCTAssertEqual(CFDSClient.error(status: 412, body: body("precondition_failed"), path: "/h"), .changedOnServer("/h"))
         XCTAssertEqual(CFDSClient.error(status: 400, body: body("cross_mount"), path: "/h"), .crossMount("/h"))
+        XCTAssertEqual(CFDSClient.error(status: 409, body: body("source_changed"), path: "/h"), .changedOnServer("/h"))
+        // The server could not reach the sign-in provider: not a reason to sign in again.
+        XCTAssertEqual(
+            CFDSClient.error(status: 503, body: body("auth_unavailable"), path: "/h"),
+            .server(status: 503, code: "auth_unavailable", message: "m"))
     }
 }
 
