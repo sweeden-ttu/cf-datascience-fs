@@ -22,10 +22,41 @@ async function run() {
   await vscode.workspace.getConfiguration("cfds").update("serverUrl", process.env.CFDS_TEST_SERVER, vscode.ConfigurationTarget.Global);
   const ext = vscode.extensions.getExtension("cloudfronts.cfds");
   assert.ok(ext, "extension cloudfronts.cfds is installed");
-  await ext.activate();
+  const api = await ext.activate();
   const fs = vscode.workspace.fs;
   const steps = [];
   const step = async (name, fn) => { await fn(); steps.push(name); console.log(`  ok - ${name}`); };
+
+  if (process.env.CFDS_TEST_ISSUER) {
+    await vscode.workspace.getConfiguration("cfds").update("oidc.issuer", process.env.CFDS_TEST_ISSUER, vscode.ConfigurationTarget.Global);
+    await step("sign in through the OIDC browser flow (PKCE) and get a session", async () => {
+      // Stand in for the browser: follow the provider's /authorize redirect and hand
+      // the vscode:// callback back to VS Code, which routes it to the URI handler.
+      const realOpen = vscode.env.openExternal;
+      let opened;
+      vscode.env.openExternal = async (target) => {
+        if (target.scheme !== "http" && target.scheme !== "https") return realOpen(target);
+        opened = target.toString(true);
+        const res = await fetch(opened, { redirect: "manual" });
+        const location = res.headers.get("location");
+        assert.ok(location && location.startsWith(`${vscode.env.uriScheme}://cloudfronts.cfds/auth?`), `redirect to callback, got ${location}`);
+        setTimeout(() => realOpen(vscode.Uri.parse(location, true)), 50);
+        return true;
+      };
+      try {
+        const session = await api.login(false);
+        assert.ok(session.accessToken.split(".").length === 3, "got a JWT access token");
+        assert.strictEqual(session.account.id, "alice");
+      } finally {
+        vscode.env.openExternal = realOpen;
+      }
+      const q = new URL(opened).searchParams;
+      assert.strictEqual(q.get("client_id"), "cfds-vscode");
+      assert.strictEqual(q.get("code_challenge_method"), "S256");
+      const sessions = await api.sessions();
+      assert.strictEqual(sessions.length, 1, "the session is stored");
+    });
+  }
 
   await step("root lists the two mounts", async () => {
     const names = (await fs.readDirectory(u("/"))).map(([n, t]) => `${n}:${t}`).sort();
@@ -69,6 +100,14 @@ async function run() {
   await step("recursive delete", async () => {
     await fs.delete(u("/home/notebooks"), { recursive: true, useTrash: false });
     await expectFsError(fs.stat(u("/home/notebooks")), "FileNotFound");
+  });
+  await step("/v1/me reports the free tier quota", async () => {
+    const res = await fetch(process.env.CFDS_TEST_SERVER + "/v1/me", {
+      headers: { Authorization: `Bearer ${process.env.CFDS_TOKEN ?? (await api.sessions())[0].accessToken}` },
+    });
+    const me = await res.json();
+    assert.strictEqual(me.quota.limit, 107374182400);
+    assert.deepStrictEqual(me.mounts.map((m) => m.path).sort(), ["/home", "/kaggle-datasets"]);
   });
   await step("status bar quota command runs", async () => {
     await vscode.commands.executeCommand("cfds.showQuota");

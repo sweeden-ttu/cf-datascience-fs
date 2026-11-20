@@ -5,7 +5,13 @@ import { CfdsFileSystemProvider, SCHEME } from "./fsProvider";
 
 let cachedClient: { url: string; client: CfdsClient } | undefined;
 
-export function activate(context: vscode.ExtensionContext) {
+export interface CfdsApi {
+  /** Interactive sign-in (or sign-up). Exposed for the end-to-end tests. */
+  login(signUp?: boolean): Promise<vscode.AuthenticationSession>;
+  sessions(): Promise<readonly vscode.AuthenticationSession[]>;
+}
+
+export function activate(context: vscode.ExtensionContext): CfdsApi {
   const auth = new CloudfrontsAuthProvider(context);
   context.subscriptions.push(auth);
   const tokens = makeTokenSource(auth);
@@ -109,6 +115,8 @@ export function activate(context: vscode.ExtensionContext) {
       }
     }),
   );
+
+  return { login: (signUp = false) => auth.login([], signUp), sessions: () => auth.getSessions() };
 }
 
 function envToken(): string | undefined {

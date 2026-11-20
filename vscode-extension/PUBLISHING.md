@@ -9,6 +9,9 @@ npm run typecheck
 npm test            # unit tests; reads run against the real Python cfds-server in ../src
 npm run test:e2e    # launches a real VS Code against an in-memory server
                     # (Linux without a display: xvfb-run -a npm run test:e2e)
+CFDS_SERVER_REPO=.. npm run test:e2e
+                    # same, against the real multi-user cfds-server, signing in
+                    # through the extension's OIDC flow with a stand-in provider
 npm run package     # -> cfds-<version>.vsix
 ```
 
@@ -22,7 +25,8 @@ These need someone with access to the Cloudfronts accounts:
    with PKCE required, scopes `openid profile email`, and these redirect URIs:
    - `vscode://cloudfronts.cfds/auth` (VS Code stable)
    - `vscode-insiders://cloudfronts.cfds/auth` (Insiders, optional)
-   - `https://vscode.dev/redirect` if vscode.dev support is wanted
+   - for vscode.dev, the https callback URL VS Code generates there (check it in a
+     test sign-in; desktop always sends exactly `vscode://cloudfronts.cfds/auth`)
    The extension id `cloudfronts.cfds` comes from `publisher` + `name` in
    `package.json`; if either changes, the redirect URIs change with it.
 2. **Production server** reachable at `https://storage.cloudfronts.group` (the

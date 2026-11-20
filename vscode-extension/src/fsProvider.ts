@@ -36,6 +36,9 @@ export function toFsError(err: unknown, uri: vscode.Uri): Error {
         if (err.code === "not_empty") {
           return new vscode.FileSystemError(`${uri.path} is not empty.`);
         }
+        if (err.code === "source_changed") {
+          return new vscode.FileSystemError(`${uri.path} changed on the server during the copy. Try again.`);
+        }
         return vscode.FileSystemError.FileExists(uri);
       case 400:
         if (err.code === "is_a_directory") return vscode.FileSystemError.FileIsADirectory(uri);
@@ -48,6 +51,9 @@ export function toFsError(err: unknown, uri: vscode.Uri): Error {
         return new vscode.FileSystemError(`${uri.path}: ${err.message}`);
       case 401:
         return vscode.FileSystemError.NoPermissions(`Sign in to Cloudfronts to access ${uri.path}`);
+      case 405:
+        // A single-tree server started without --writable.
+        return vscode.FileSystemError.NoPermissions(`${uri.path}: this server is read-only.`);
       case 403:
         if (err.code === "read_only") {
           return vscode.FileSystemError.NoPermissions(`${uri.path} is read-only.`);

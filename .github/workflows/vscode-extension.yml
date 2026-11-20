@@ -31,13 +31,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install the Python server (reads in the unit tests run against it)
-        run: python -m pip install -e ..
+      - name: Install the Python server (unit tests and the real-server e2e run against it)
+        run: python -m pip install -e ".." "PyJWT[crypto]>=2.8"
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
-      - name: End-to-end in a real VS Code
+      - name: End-to-end in a real VS Code (in-memory server)
         run: xvfb-run -a npm run test:e2e
+      - name: End-to-end in a real VS Code (real cfds-server and OIDC sign-in)
+        if: hashFiles('tests/fake_oidc.py') != ''
+        run: xvfb-run -a npm run test:e2e
+        env:
+          CFDS_SERVER_REPO: ${{ github.workspace }}
       - run: npm run package
       - uses: actions/upload-artifact@v4
         with:

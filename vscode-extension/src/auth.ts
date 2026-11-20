@@ -1,8 +1,7 @@
 // "Cloudfronts" authentication provider: OIDC authorization code + PKCE against
 // oidc.cloudfronts.group. The browser redirects back into VS Code through the
-// extension's URI handler (vscode://cloudfronts.cfds/auth),
-// which also works in Remote/Kubernetes windows and on vscode.dev because the
-// redirect URI goes through env.asExternalUri.
+// extension's URI handler (vscode://cloudfronts.cfds/auth). That also works in
+// Remote/Kubernetes windows, because the URI handler runs on the local client.
 
 import * as vscode from "vscode";
 import {
@@ -153,7 +152,14 @@ export class CloudfrontsAuthProvider implements vscode.AuthenticationProvider, v
     const callback = vscode.Uri.parse(
       `${vscode.env.uriScheme}://${this.context.extension.id}${CALLBACK_PATH}`,
     );
-    const redirectUri = (await vscode.env.asExternalUri(callback)).toString(true);
+    // Desktop (also Remote-SSH, Dev Containers, Kubernetes): send the plain
+    // vscode://cloudfronts.cfds/auth, because providers match redirect URIs exactly and
+    // asExternalUri would append "?windowId=N". The OS routes it to VS Code, which
+    // hands it to this extension. On vscode.dev it must become an https URL.
+    const redirectUri =
+      vscode.env.uiKind === vscode.UIKind.Web
+        ? (await vscode.env.asExternalUri(callback)).toString(true)
+        : callback.toString(true);
     const state = randomString();
     const nonce = randomString();
     const verifier = randomString(48);
