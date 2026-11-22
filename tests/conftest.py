@@ -6,18 +6,27 @@ import threading
 
 import pytest
 
-from cf_datascience_fs import CFDataScienceFileSystem
+from cf_datascience_fs import CFDataScienceAsyncFileSystem, CFDataScienceFileSystem
 from cf_datascience_fs.server import make_server
 
 BIG_SIZE = 5 * 1024 * 1024 + 123
 
 
 @pytest.fixture(autouse=True)
-def _direct_loopback(monkeypatch):
+def _direct_loopback(monkeypatch, tmp_path_factory):
     """Never send test traffic through an HTTP proxy configured in the environment."""
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost,::1")
     monkeypatch.setenv("no_proxy", "127.0.0.1,localhost,::1")
     monkeypatch.delenv("CFDS_TOKEN", raising=False)
+    # ...and never pick up credentials from the developer's ~/.netrc.
+    netrc = tmp_path_factory.mktemp("netrc") / "netrc"
+    netrc.write_text("")
+    monkeypatch.setenv("NETRC", str(netrc))
+    yield
+    for cls in (CFDataScienceFileSystem, CFDataScienceAsyncFileSystem):
+        for instance in list(cls._cache.values()):
+            instance.close()
+        cls.clear_instance_cache()
 
 
 def _deterministic_bytes(size: int) -> bytes:
@@ -69,11 +78,14 @@ def server(drive):
     stop_server(server, thread)
 
 
-@pytest.fixture
-def fs(server):
-    return CFDataScienceFileSystem(
-        host="127.0.0.1", port=server.port, retries=0, skip_instance_cache=True
-    )
+@pytest.fixture(params=["sync", "async"])
+def fs(request, server):
+    """Both clients: the read-only one built on requests, and the registered async one
+    (used here through fsspec's synchronous wrappers)."""
+    cls = CFDataScienceFileSystem if request.param == "sync" else CFDataScienceAsyncFileSystem
+    filesystem = cls(host="127.0.0.1", port=server.port, retries=0, skip_instance_cache=True)
+    yield filesystem
+    filesystem.close()
 
 
 @pytest.fixture
@@ -92,3 +104,9 @@ def can_symlink(tmp_path) -> bool:
         return False
     os.unlink(tmp_path / "__probe__")
     return True
+
+
+def bump_mtime(path, seconds=5):
+    """Move a file's mtime forward, so a rewrite is visible whatever the timestamp resolution."""
+    st = os.stat(path)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + seconds * 1_000_000_000))

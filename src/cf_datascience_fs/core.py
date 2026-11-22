@@ -1,4 +1,7 @@
-"""fsspec client for :mod:`cf_datascience_fs.server`.
+"""Read-only fsspec client for :mod:`cf_datascience_fs.server`, built on ``requests``.
+
+This is the original client. :class:`cf_datascience_fs.asyn.CFDataScienceAsyncFileSystem`
+(registered for ``cfds://``) reads *and* writes, and works from async code too.
 
 The filesystem is read-only. Paths are absolute within the served root, so
 ``/datasets/train.csv`` here is ``/mnt/TMP/datasets/train.csv`` on the server when the
@@ -10,6 +13,8 @@ from __future__ import annotations
 import datetime
 import errno
 import os
+import secrets
+import string
 import threading
 from urllib.parse import quote, urlsplit
 
@@ -20,12 +25,14 @@ from fsspec.utils import isfilelike, stringify_path
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from ._errors import FileChangedError
 from ._version import __version__
 
 DEFAULT_PORT = 8765
 _PROTOCOLS = ("cfds", "cfdss")
 _TLS_PROTOCOL = "cfdss"
 _DOWNLOAD_CHUNK = 1024 * 1024
+_TOKEN_CHARS = frozenset(string.ascii_letters + string.digits + "-._~+/=")
 
 
 def _split_url(path: str) -> tuple[str | None, str | None, str]:
@@ -47,21 +54,43 @@ def _read_only(path: str | None = None) -> OSError:
     return OSError(errno.EROFS, "cfds is a read-only file system", path)
 
 
-class FileChangedError(OSError):
-    """The remote file was modified after it was opened or stat-ed."""
-
-
 class _RangeNotSatisfiable(OSError):
     """The requested byte range starts at or beyond the end of the file."""
+
+
+class _IncompleteRead(OSError):
+    """Fewer (or more) bytes arrived than the server announced."""
+
+
+class _BearerAuth(requests.auth.AuthBase):
+    """Adds the bearer token, looked up at request time.
+
+    Being set as ``session.auth`` also stops ``requests`` from replacing the header
+    with credentials from the user's ``~/.netrc``.
+    """
+
+    def __init__(self, get_token):
+        self._get_token = get_token
+
+    def __call__(self, request):
+        token = self._get_token()
+        if token:
+            request.headers["Authorization"] = f"Bearer {token}"
+        return request
+
+
+def _raise_unless_missing(exc: OSError) -> None:
+    """``walk`` error handler: a directory that vanished is skipped, anything else is an error."""
+    if not isinstance(exc, (FileNotFoundError, NotADirectoryError)):
+        raise exc
 
 
 def _check_length(response, received: int, path: str) -> None:
     """Raise if fewer (or more) bytes arrived than the server promised."""
     declared = response.headers.get("Content-Length")
     if declared is not None and declared.isdigit() and int(declared) != received:
-        raise OSError(
-            f"{path}: incomplete read from the cfds server "
-            f"({received} of {declared} bytes); the file may have changed"
+        raise _IncompleteRead(
+            f"{path}: incomplete read from the cfds server ({received} of {declared} bytes)"
         )
 
 
@@ -74,7 +103,8 @@ class CFDataScienceFileSystem(AbstractFileSystem):
         Where ``cfds-server`` is listening. In a URL they are the authority part:
         ``cfds://host:port/path``.
     token:
-        Bearer token, if the server requires one. Defaults to ``$CFDS_TOKEN``.
+        Bearer token, if the server requires one. When not given, ``$CFDS_TOKEN`` is
+        read each time a request is made.
     use_ssl:
         Talk HTTPS instead of HTTP. The ``cfdss://`` scheme sets this for you.
     verify:
@@ -85,7 +115,7 @@ class CFDataScienceFileSystem(AbstractFileSystem):
         How many times to retry a request after a connection failure or a
         502/503/504 response.
     block_size:
-        Default read-ahead block for :meth:`open`, in bytes.
+        Read-ahead block for :meth:`open`, in bytes, unless ``open`` is given its own.
     use_listings_cache, listings_expiry_time, max_paths:
         fsspec directory-listing cache settings. The cache is off by default because
         the drive can change at any time.
@@ -118,19 +148,40 @@ class CFDataScienceFileSystem(AbstractFileSystem):
         )
         self.host = host
         self.port = int(port) if port is not None else DEFAULT_PORT
-        self.token = token if token is not None else (os.environ.get("CFDS_TOKEN") or None)
+        if token is not None:
+            self._check_token(token)
+        self._explicit_token = token
         self.use_ssl = bool(use_ssl)
         self.verify = verify
-        self.timeout = timeout
+        # A (connect, read) pair comes back from to_json()/from_json() as a list.
+        self.timeout = tuple(timeout) if isinstance(timeout, (list, tuple)) else timeout
         self.retries = int(retries)
-        if block_size is not None:
-            self.blocksize = int(block_size)
+        self._block_size = int(block_size) if block_size is not None else None
+        if self._block_size is not None:
+            self.blocksize = self._block_size
         netloc = f"[{host}]" if ":" in host and not host.startswith("[") else host
         self._netloc = f"{netloc}:{self.port}"
         self.base_url = f"{'https' if self.use_ssl else 'http'}://{self._netloc}"
         self._session = None
         self._session_pid = None
         self._session_lock = threading.Lock()
+
+    @staticmethod
+    def _check_token(token: str) -> None:
+        if not token or not set(token) <= _TOKEN_CHARS:
+            raise ValueError(
+                "the token must be non-empty and use only letters, digits and -._~+/= characters"
+            )
+
+    @property
+    def token(self) -> str | None:
+        """The bearer token in effect: the ``token`` argument, else ``$CFDS_TOKEN``."""
+        if self._explicit_token is not None:
+            return self._explicit_token
+        token = os.environ.get("CFDS_TOKEN") or None
+        if token is not None:
+            self._check_token(token)
+        return token
 
     # -- URL handling -------------------------------------------------------------
 
@@ -188,8 +239,7 @@ class CFDataScienceFileSystem(AbstractFileSystem):
                     session.mount("https://", adapter)
                     session.headers["User-Agent"] = f"cf-datascience-fs/{__version__}"
                     session.headers["Accept-Encoding"] = "identity"
-                    if self.token:
-                        session.headers["Authorization"] = f"Bearer {self.token}"
+                    session.auth = _BearerAuth(lambda: self.token)
                     self._session, self._session_pid = session, pid
         return self._session
 
@@ -224,6 +274,13 @@ class CFDataScienceFileSystem(AbstractFileSystem):
                 response.close()
         return response
 
+    def close(self) -> None:
+        """Close pooled connections. The filesystem can still be used afterwards."""
+        with self._session_lock:
+            session, self._session = self._session, None
+        if session is not None:
+            session.close()
+
     @staticmethod
     def _raise_for_response(response, path: str):
         status = response.status_code
@@ -242,7 +299,7 @@ class CFDataScienceFileSystem(AbstractFileSystem):
             raise OSError(
                 f"{message} (is a cfds server listening at this address, with a matching version?)"
             )
-        if status in (401, 403):
+        if status in (401, 403, 421):
             raise PermissionError(errno.EACCES, message, path)
         if status == 400:
             raise ValueError(message)
@@ -283,6 +340,7 @@ class CFDataScienceFileSystem(AbstractFileSystem):
             except KeyError:
                 entries = None
         if entries is None:
+            self.dircache.pop(path, None)  # a failed refresh must not leave a stale entry
             described = self._describe(path, list_entries=True)
             if described["info"]["type"] == "directory":
                 entries = described["entries"] or []
@@ -302,9 +360,87 @@ class CFDataScienceFileSystem(AbstractFileSystem):
             self.dircache.clear()
         else:
             path = self._strip_protocol(path)
-            self.dircache.pop(path, None)
+            below = path.rstrip("/") + "/"
+            for key in [key for key in self.dircache if key == path or key.startswith(below)]:
+                self.dircache.pop(key, None)
             self.dircache.pop(self._parent(path), None)
         super().invalidate_cache(path)
+
+    # fsspec's defaults turn *every* failure into "does not exist", so a wrong token or
+    # an unreachable server would look like an empty drive. Only "not found" means that.
+
+    def exists(self, path, **kwargs):
+        try:
+            self.info(path, **kwargs)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        return True
+
+    def isdir(self, path):
+        try:
+            return self.info(path)["type"] == "directory"
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+
+    def isfile(self, path):
+        try:
+            return self.info(path)["type"] == "file"
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+
+    def walk(self, path, maxdepth=None, topdown=True, on_error=_raise_unless_missing, **kwargs):
+        """Like :meth:`fsspec.spec.AbstractFileSystem.walk`, with two differences.
+
+        Symlinked directories are reported but not entered (as ``os.walk`` does by
+        default), so a link that points back up the tree cannot cause endless recursion.
+        Errors other than "not found" are raised instead of silently skipping a subtree;
+        pass ``on_error="omit"`` for fsspec's usual behaviour.
+        """
+        if maxdepth is not None and maxdepth < 1:
+            raise ValueError("maxdepth must be at least 1")
+        path = self._strip_protocol(path)
+        detail = kwargs.pop("detail", False)
+        try:
+            listing = self.ls(path, detail=True, **kwargs)
+        except OSError as exc:
+            if on_error == "raise":
+                raise
+            if callable(on_error):
+                on_error(exc)
+            return
+
+        dirs, files, descend = {}, {}, {}
+        for info in listing:
+            pathname = info["name"].rstrip("/") or "/"
+            name = pathname.rsplit("/", 1)[-1]
+            if info["type"] == "directory" and pathname != path:
+                dirs[name] = info
+                if not info.get("islink"):
+                    descend[name] = pathname
+            elif pathname == path:
+                files[""] = info  # the path given was a file
+            else:
+                files[name] = info
+
+        if topdown:
+            # The caller may prune ``dirs`` in place, as with os.walk.
+            yielded_dirs = dirs if detail else list(dirs)
+            yield path, yielded_dirs, (files if detail else list(files))
+            descend = {name: full for name, full in descend.items() if name in yielded_dirs}
+
+        if maxdepth is None or maxdepth > 1:
+            for full_path in descend.values():
+                yield from self.walk(
+                    full_path,
+                    maxdepth=None if maxdepth is None else maxdepth - 1,
+                    topdown=topdown,
+                    on_error=on_error,
+                    detail=detail,
+                    **kwargs,
+                )
+
+        if not topdown:
+            yield path, (dirs if detail else list(dirs)), (files if detail else list(files))
 
     def modified(self, path):
         mtime = self.info(path)["mtime"]
@@ -329,16 +465,34 @@ class CFDataScienceFileSystem(AbstractFileSystem):
         info = self.info(path)
         if info["type"] == "directory":
             raise IsADirectoryError(errno.EISDIR, "is a directory", path)
+        if info["type"] != "file":
+            raise PermissionError(errno.EACCES, "not a regular file", path)
+        # fsspec itself passes size= (pickled files, blockcache). The size just read from
+        # the server is used instead, so that it always agrees with the pinned ETag.
+        kwargs.pop("size", None)
+        kwargs.pop("etag", None)
         return CFDataScienceFile(
             self,
             path,
             mode=mode,
-            block_size=block_size,
+            block_size=block_size if block_size is not None else self._block_size,
             cache_options=cache_options,
             size=info["size"],
             etag=info.get("etag"),
             **kwargs,
         )
+
+    def _incomplete(self, path: str, etag: str | None, cause: Exception) -> OSError:
+        """The right exception for a transfer that ended early."""
+        try:
+            current = self.info(path).get("etag")
+        except FileNotFoundError:
+            return FileChangedError(f"{path}: the file was removed while it was being read")
+        except OSError:
+            current = etag  # cannot tell; report the interruption itself
+        if etag is not None and current != etag:
+            return FileChangedError(f"{path}: the file changed on the server while it was read")
+        return OSError(f"{path}: the transfer was interrupted: {cause}")
 
     def _fetch(self, path: str, start: int | None, end: int | None, etag: str | None = None):
         """Bytes ``start`` (inclusive) to ``end`` (exclusive); ``None`` means open-ended."""
@@ -353,16 +507,19 @@ class CFDataScienceFileSystem(AbstractFileSystem):
                 return b""
             headers["Range"] = f"bytes={first}-{'' if end is None else end - 1}"
         try:
-            response = self._request("file", path, headers=headers)
+            # Streamed, so that a body cut short by the server is read (and reported) here
+            # rather than inside requests, where it would look like an unreachable server.
+            response = self._request("file", path, headers=headers, stream=True)
         except _RangeNotSatisfiable:
             return b""  # reading at or past the end of the file, like a Python slice
+        sent_etag = etag or response.headers.get("ETag")
         try:
             data = response.content
-        except requests.RequestException as exc:
-            raise OSError(f"{path}: the connection broke while reading: {exc}") from exc
+            _check_length(response, len(data), path)
+        except (requests.RequestException, _IncompleteRead) as exc:
+            raise self._incomplete(path, sent_etag, exc) from exc
         finally:
             response.close()
-        _check_length(response, len(data), path)
         if response.status_code == 200 and "Range" in headers:
             # Something between us and the server ignored the Range header.
             if start is not None and start < 0:
@@ -386,7 +543,12 @@ class CFDataScienceFileSystem(AbstractFileSystem):
         return self._fetch(path, start, end)
 
     def get_file(self, rpath, lpath, callback=DEFAULT_CALLBACK, outfile=None, **kwargs):
-        """Download one file in a single streamed request."""
+        """Download one file in a single streamed request.
+
+        When writing to a local path, the data goes to a temporary file next to it that
+        replaces ``lpath`` only once the download is complete. A failed download leaves
+        ``lpath`` as it was.
+        """
         rpath = self._strip_protocol(rpath)
         if outfile is None and isfilelike(lpath):
             outfile = lpath
@@ -395,27 +557,42 @@ class CFDataScienceFileSystem(AbstractFileSystem):
             if outfile is None:
                 os.makedirs(lpath, exist_ok=True)
             return None
-        headers = {"If-Match": info["etag"]} if info.get("etag") else None
-        response = self._request("file", rpath, headers=headers, stream=True)
-        close_outfile = outfile is None
+        etag = info.get("etag")
+        response = self._request(
+            "file", rpath, headers={"If-Match": etag} if etag else None, stream=True
+        )
+        temporary = None
         try:
-            if close_outfile:
+            if outfile is None:
                 parent = os.path.dirname(os.path.abspath(lpath))
                 os.makedirs(parent, exist_ok=True)
-                outfile = open(lpath, "wb")  # noqa: SIM115 - closed in the finally below
-            callback.set_size(info["size"])
-            received = 0
-            for chunk in response.iter_content(chunk_size=_DOWNLOAD_CHUNK):
-                outfile.write(chunk)
-                received += len(chunk)
-                callback.relative_update(len(chunk))
-            _check_length(response, received, rpath)
-        except requests.RequestException as exc:
-            raise OSError(f"{rpath}: the connection broke while downloading: {exc}") from exc
+                temporary = f"{os.path.abspath(lpath)}.{secrets.token_hex(4)}.part"
+                target = open(temporary, "xb")  # noqa: SIM115 - closed below
+            else:
+                target = outfile
+            try:
+                callback.set_size(info["size"])
+                received = 0
+                for chunk in response.iter_content(chunk_size=_DOWNLOAD_CHUNK):
+                    target.write(chunk)
+                    received += len(chunk)
+                    callback.relative_update(len(chunk))
+                _check_length(response, received, rpath)
+            except (requests.RequestException, _IncompleteRead) as exc:
+                raise self._incomplete(rpath, etag, exc) from exc
+            finally:
+                if temporary is not None:
+                    target.close()
+            if temporary is not None:
+                os.replace(temporary, lpath)
+                temporary = None
         finally:
             response.close()
-            if close_outfile and outfile is not None:
-                outfile.close()
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
 
     # -- everything that would write ---------------------------------------------
 
